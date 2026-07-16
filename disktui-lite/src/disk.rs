@@ -174,7 +174,7 @@ impl DiskInfo {
                     let is_match = if dev_name == name {
                         true
                     } else if let Some(suffix) = dev_name.strip_prefix(name) {
-                        let first_char = suffix.chars().next().unwrap_or(' ');
+                        let first_char = suffix.chars().next().unwrap();
                         first_char.is_ascii_digit() || first_char == 'p'
                     } else {
                         false

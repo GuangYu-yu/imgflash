@@ -233,10 +233,7 @@ pub fn poll_dd_progress(app: &mut App) {
         return;
     }
 
-    let progress = match app.progress.as_mut() {
-        Some(p) => p,
-        None => return,
-    };
+    let progress = app.progress.as_mut().unwrap();
 
     if progress.finished {
         return;
