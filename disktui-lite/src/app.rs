@@ -47,13 +47,6 @@ impl ConfirmButton {
             Self::Yes => Self::No,
         };
     }
-
-    pub fn index(&self) -> usize {
-        match self {
-            Self::No => 0,
-            Self::Yes => 1,
-        }
-    }
 }
 
 // ── Success screen actions ──────────────────────────────────────────────
@@ -223,7 +216,7 @@ impl App {
             reboot_last_tick: 0,
             notifications: Vec::new(),
             show_help: false,
-            theme: Theme::new(),
+            theme: Theme::default(),
             tick_count: 0,
             exit_action: ExitAction::None,
         })
@@ -274,9 +267,8 @@ impl App {
         }
 
         // Rotate spinner when writing
-        if self.screen == Screen::Writing
-            && let Some(ref mut p) = self.progress
-        {
+        if self.screen == Screen::Writing {
+            let p = self.progress.as_mut().unwrap();
             p.spinner_index = (p.spinner_index + 1) % 10;
         }
 

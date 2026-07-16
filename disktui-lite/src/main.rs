@@ -16,15 +16,12 @@ fn main() -> AppResult<()> {
     // This gives us process isolation for uu_dd: we can kill it with
     // Child::kill() and read progress via /proc/$PID/io.
     if std::env::args().any(|a| a == "--dd") {
-        let dd_args: Vec<std::ffi::OsString> = std::iter::once(std::ffi::OsString::from("dd"))
+        let dd_args = std::iter::once(std::ffi::OsString::from("dd"))
             .chain(std::env::args_os()
                 .skip_while(|arg| arg != "--dd")
-                .skip(1))
-            .collect();
-        if !dd_args.is_empty() {
-            let code = uu_dd::uumain(dd_args.into_iter());
-            std::process::exit(code);
-        }
+                .skip(1));
+        let code = uu_dd::uumain(dd_args);
+        std::process::exit(code);
     }
 
     // Detect if we are PID 1 (running as init in initramfs)

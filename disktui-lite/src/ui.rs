@@ -150,11 +150,11 @@ fn render_disks_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .iter()
         .map(|disk| {
             Row::new(vec![
-                Cell::from(disk.name.clone()),
-                Cell::from(disk.size_str.clone()),
-                Cell::from(disk.transport.clone()),
-                Cell::from(disk.disk_type.clone()),
-                Cell::from(disk.model.clone().unwrap_or_default()),
+                Cell::from(disk.name.as_str()),
+                Cell::from(disk.size_str.as_str()),
+                Cell::from(disk.transport.as_str()),
+                Cell::from(disk.disk_type.as_str()),
+                Cell::from(disk.model.as_deref().unwrap_or_default()),
             ])
         })
         .collect();
@@ -198,7 +198,7 @@ fn render_disk_summary(app: &App, frame: &mut Frame, area: Rect) {
         };
 
         Line::from(vec![
-            Span::from(format!("{} | {} | {} | {}", disk.model.clone().unwrap_or_default(), disk.transport, disk.dev_path, removable_str)),
+            Span::from(format!("{} | {} | {} | {}", disk.model.as_deref().unwrap_or(""), disk.transport, disk.dev_path, removable_str)),
             Span::from(format!(" | {}", mount_str)),
         ])
     } else {
@@ -316,10 +316,7 @@ fn render_confirmation_dialog(app: &App, frame: &mut Frame) {
 // ═══════════════════════════════════════════════════════════════════════
 
 fn render_progress_dialog(app: &App, frame: &mut Frame) {
-    let progress = match &app.progress {
-        Some(p) => p,
-        None => return,
-    };
+    let progress = app.progress.as_ref().unwrap();
 
     let area = centered_rect(64, 12, frame.area());
 

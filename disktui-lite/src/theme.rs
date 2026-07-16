@@ -44,9 +44,3 @@ impl Default for Theme {
         }
     }
 }
-
-impl Theme {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}

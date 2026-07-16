@@ -171,14 +171,11 @@ impl DiskInfo {
                 if let (Some(dev_path), Some(mount_point)) = (parts.next(), parts.next())
                     && let Some(dev_name) = dev_path.strip_prefix("/dev/")
                 {
-                    let is_match = if dev_name == name {
-                        true
-                    } else if let Some(suffix) = dev_name.strip_prefix(name) {
-                        let first_char = suffix.chars().next().unwrap();
-                        first_char.is_ascii_digit() || first_char == 'p'
-                    } else {
-                        false
-                    };
+                    let is_match = dev_name == name
+                        || dev_name.strip_prefix(name).is_some_and(|suffix| {
+                            let first_char = suffix.chars().next().unwrap();
+                            first_char.is_ascii_digit() || first_char == 'p'
+                        });
 
                     if is_match {
                         return (true, Some(mount_point.to_string()));
