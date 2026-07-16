@@ -112,18 +112,15 @@ fn handle_confirmation(key: crossterm::event::KeyEvent, app: &mut App) -> anyhow
 
     handle_dialog_toggle(&key, &mut app.confirm_button);
 
-    match key.code {
-        KeyCode::Enter => {
-            if app.confirm_button == ConfirmButton::Yes {
-                if let Err(e) = start_write(app) {
-                    app.notify(format!("Failed to start write: {}", e), crate::notification::NotificationLevel::Error);
-                    app.goto_disk_list();
-                }
-            } else {
+    if key.code == KeyCode::Enter {
+        if app.confirm_button == ConfirmButton::Yes {
+            if let Err(e) = start_write(app) {
+                app.notify(format!("Failed to start write: {}", e), crate::notification::NotificationLevel::Error);
                 app.goto_disk_list();
             }
+        } else {
+            app.goto_disk_list();
         }
-        _ => {}
     }
     Ok(())
 }

@@ -136,13 +136,12 @@ impl DiskInfo {
         let base = Path::new("/sys/block").join(name);
 
         // Try device/subsystem first (most direct way)
-        if let Ok(link) = fs::read_link(base.join("device/subsystem")) {
-            if let Some(subsystem) = link.file_name() {
+        if let Ok(link) = fs::read_link(base.join("device/subsystem"))
+            && let Some(subsystem) = link.file_name() {
                 let s = subsystem.to_string_lossy().to_string();
                 if s == "usb" { return "USB".to_string(); }
                 if s == "virtio" { return "VirtIO".to_string(); }
                 if s != "scsi" { return s; } // e.g. "ata"
-            }
         }
 
         // Fallback: read device symlink path for transport hints
