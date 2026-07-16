@@ -63,6 +63,13 @@ fn main() -> AppResult<()> {
     #[cfg(unix)]
     {
         use nix::sys::signal::{SigHandler, Signal};
+        // SAFETY:
+        // - We are installing SIG_IGN (ignore), not a function pointer, so there is
+        //   no risk of invoking undefined behavior through a dangling handler.
+        // - The program runs single-threaded at this point (no other threads exist),
+        //   so the signal mask update is race-free.
+        // - nix::sys::signal::signal is a safe wrapper around libc::signal that
+        //   validates the handler variant and does not expose the raw C API.
         unsafe {
             nix::sys::signal::signal(Signal::SIGINT, SigHandler::SigIgn)?;
         }

@@ -71,17 +71,17 @@ impl SuccessAction {
 
 #[derive(Debug)]
 pub struct WriteProgress {
-    pub disk_name: String,
-    pub disk_model: String,
-    pub total_bytes: u64,
-    pub written_bytes: u64,
+    pub(crate) disk_name: String,
+    pub(crate) disk_model: String,
+    pub(crate) total_bytes: u64,
+    pub(crate) written_bytes: u64,
     /// Instantaneous speed in MB/s.
-    pub speed: f64,
+    pub(crate) speed: f64,
     dd_child: Option<Child>,
     dd_pid: u32,
-    pub finished: bool,
-    pub success: bool,
-    pub spinner_index: usize,
+    pub(crate) finished: bool,
+    pub(crate) success: bool,
+    pub(crate) spinner_index: usize,
 }
 
 impl WriteProgress {
@@ -176,19 +176,19 @@ impl WriteProgress {
 
 pub struct App {
     pub running: bool,
-    pub screen: Screen,
-    pub disks: Vec<DiskInfo>,
-    pub disks_state: TableState,
-    pub confirm_button: ConfirmButton,
-    pub progress: Option<WriteProgress>,
-    pub success_action: SuccessAction,
-    pub reboot_counting: bool,
-    pub reboot_countdown: u8,
-    pub reboot_last_tick: u64,
-    pub notifications: Vec<Notification>,
-    pub show_help: bool,
-    pub theme: Theme,
-    pub tick_count: u64,
+    pub(crate) screen: Screen,
+    pub(crate) disks: Vec<DiskInfo>,
+    pub(crate) disks_state: TableState,
+    pub(crate) confirm_button: ConfirmButton,
+    pub(crate) progress: Option<WriteProgress>,
+    pub(crate) success_action: SuccessAction,
+    pub(crate) reboot_counting: bool,
+    pub(crate) reboot_countdown: u8,
+    pub(crate) reboot_last_tick: u64,
+    pub(crate) notifications: Vec<Notification>,
+    pub(crate) show_help: bool,
+    pub(crate) theme: Theme,
+    pub(crate) tick_count: u64,
     pub exit_action: ExitAction,
 }
 
