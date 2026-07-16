@@ -11,6 +11,32 @@ use disktui_lite::init;
 use disktui_lite::tui::Tui;
 use disktui_lite::ui;
 
+/// Shared exit routine: clean up TUI, flush output, sync and power off/reboot.
+fn exit_with_action(
+    tui: &mut Tui<CrosstermBackend<io::Stdout>>,
+    is_pid1: bool,
+    message: &str,
+    halt_msg: &str,
+    #[cfg(target_os = "linux")] mode: nix::sys::reboot::RebootMode,
+) -> AppResult<()> {
+    tui.exit()?;
+    print!("\x1Bc");
+    println!("{}", message);
+    io::stdout().flush().ok();
+    #[cfg(not(target_os = "linux"))]
+    let _ = (is_pid1, halt_msg);
+    #[cfg(target_os = "linux")]
+    {
+        nix::unistd::sync();
+        let _ = nix::sys::reboot::reboot(mode);
+    }
+    #[cfg(target_os = "linux")]
+    if is_pid1 {
+        init::emergency_halt(halt_msg);
+    }
+    Ok(())
+}
+
 fn main() -> AppResult<()> {
     // Self-fork: if invoked with --dd, run as dd subprocess and exit.
     // This gives us process isolation for uu_dd: we can kill it with
@@ -80,38 +106,18 @@ fn main() -> AppResult<()> {
 
     // ── Handle exit action ───────────────────────────────────────
     match app.exit_action {
-        ExitAction::PowerOff => {
-            tui.exit()?;
-            print!("\x1Bc");
-            println!("Shutting down...");
-            io::stdout().flush().ok();
-            #[cfg(target_os = "linux")]
-            {
-                nix::unistd::sync();
-                let _ = nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_POWER_OFF);
-            }
-            #[cfg(target_os = "linux")]
-            if is_pid1 {
-                init::emergency_halt("Poweroff failed");
-            }
-            return Ok(());
-        }
-        ExitAction::Reboot => {
-            tui.exit()?;
-            print!("\x1Bc");
-            println!("Rebooting...");
-            io::stdout().flush().ok();
-            #[cfg(target_os = "linux")]
-            {
-                nix::unistd::sync();
-                let _ = nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_AUTOBOOT);
-            }
-            #[cfg(target_os = "linux")]
-            if is_pid1 {
-                init::emergency_halt("Reboot failed");
-            }
-            return Ok(());
-        }
+        ExitAction::PowerOff => exit_with_action(
+            &mut tui, is_pid1,
+            "Shutting down...",
+            "Poweroff failed",
+            #[cfg(target_os = "linux")] nix::sys::reboot::RebootMode::RB_POWER_OFF,
+        )?,
+        ExitAction::Reboot => exit_with_action(
+            &mut tui, is_pid1,
+            "Rebooting...",
+            "Reboot failed",
+            #[cfg(target_os = "linux")] nix::sys::reboot::RebootMode::RB_AUTOBOOT,
+        )?,
         ExitAction::None => {}
     }
 
