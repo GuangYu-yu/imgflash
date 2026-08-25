@@ -209,7 +209,9 @@ jobs:
             --disable-makeinstall-chown --disable-makeinstall-setuid \
             CC=musl-gcc \
             CPPFLAGS="${HOST_CPPFLAGS}" CFLAGS="${HOST_CFLAGS}" LDFLAGS=-static
-          make -j"$(nproc)"
+          # libtool 会吞掉 -static（仅对 libtool 库生效，程序仍动态链 musl），
+          # 程序完全静态需 -all-static，make 命令行覆盖 configure 写入的值
+          make -j"$(nproc)" LDFLAGS=-all-static
           make install
           for t in sfdisk mkswap partx; do
             cp "$(find "$PREFIX" -type f -name "$t" -print -quit)" "$OUT/"
@@ -275,7 +277,8 @@ jobs:
             CPPFLAGS="-I$PREFIX/include ${HOST_CPPFLAGS}" \
             CFLAGS="${HOST_CFLAGS}" \
             LDFLAGS="-static -L$PREFIX/lib"
-          make -j"$(nproc)"
+          # 同 util-linux：libtool 程序链接需 -all-static 才是真正静态
+          make -j"$(nproc)" LDFLAGS="-all-static -L$PREFIX/lib"
           cp ntfsprogs/ntfsresize "$OUT/"
 
       - name: 校验产物
