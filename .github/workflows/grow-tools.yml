@@ -355,6 +355,7 @@ jobs:
           cd "$SRC/LVM2.${V_LVM}"
           # Alpine APKBUILD 同款配置：--enable-static_link 让 lvm 链 -static；
           # dmeventd/cmdlib/udev/selinux 都是运行时服务侧功能，initramfs 不需要
+          MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
           ./configure \
             --prefix="$PREFIX" \
             --enable-static_link \
@@ -364,6 +365,7 @@ jobs:
             --with-blkid=none \
             --with-systemdsystemunitdir=/dev/null \
             CC=musl-gcc \
+            CPPFLAGS="-I/usr/include -I/usr/include/${MULTIARCH} -I/usr/include/asm-generic ${HOST_CPPFLAGS}" \
             CFLAGS="${HOST_CFLAGS} -I$PREFIX/include" \
             LDFLAGS="-static -L$PREFIX/lib"
           # 先 libdm：产 libdevmapper.a 进 prefix（btrfs-progs 也链接它）
