@@ -343,7 +343,7 @@ jobs:
           set -euo pipefail
           cd "$SRC/libaio-${LIBAIO_VERSION}"
           # libaio Makefile 直接支持 CC/AR/prefix 变量；静态库是 lvm 硬依赖
-          make -j"$(nproc)" CC=musl-gcc AR=ar CFLAGS="-O2 ${HOST_CFLAGS}"
+          make -j"$(nproc)" CC=musl-gcc AR=ar CFLAGS="-O2 -I. ${HOST_CFLAGS}"
           make prefix="$PREFIX" install
 
       - name: 编译 LVM2
