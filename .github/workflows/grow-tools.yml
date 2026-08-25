@@ -16,7 +16,7 @@ on:
         description: 'ntfs-3g 版本（示例 2026.7.7）'
         required: false
       btrfs_progs_version:
-        description: 'btrfs-progs 版本（示例 7.0）'
+        description: 'btrfs-progs 版本（示例 7.1）'
         required: false
       lvm2_version:
         description: 'LVM2 版本（示例 2.03.42）'
@@ -383,21 +383,19 @@ jobs:
           # PKG_CONFIG_LIBDIR 只搜 prefix：uuid/blkid（util-linux）、zlib、
           # devmapper（LVM2 libdm）全部来自本流水线的静态库，杜绝 glibc 泄漏
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
-          # --with-crypto=builtin 用源码内建 crypto；musl 无 execinfo →
-          # --disable-backtrace；convert/lzo/zstd 减依赖；文档需 sphinx
+          # btrfs-progs 7.x 起使用 make static 而非 make btrfs.static
+          # crypto 不再强制 builtin，使用默认或系统库
           ./configure \
             --prefix="$PREFIX" \
             --disable-shared \
             --disable-documentation \
             --disable-convert \
             --disable-lzo --disable-zstd \
-            --disable-backtrace \
-            --with-crypto=builtin \
             CC=musl-gcc \
             CPPFLAGS="-I$PREFIX/include ${HOST_CPPFLAGS}" \
             CFLAGS="${HOST_CFLAGS} -I$PREFIX/include" \
             LDFLAGS="-static -L$PREFIX/lib"
-          make -j"$(nproc)" btrfs.static
+          make -j"$(nproc)" static
           cp btrfs.static "$OUT/btrfs"
 
       - name: 校验产物
