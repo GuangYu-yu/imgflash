@@ -4,21 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       util_linux_version:
-        description: 'util-linux 版本（默认 2.40.4）'
-        required: false
-        default: '2.40.4'
+        description: 'util-linux 版本（示例 2.41.5）'
+        required: true
       e2fsprogs_version:
-        description: 'e2fsprogs 版本（默认 1.47.2）'
-        required: false
-        default: '1.47.2'
+        description: 'e2fsprogs 版本（示例 1.47.4）'
+        required: true
       xfsprogs_version:
-        description: 'xfsprogs 版本（默认 6.13.0）'
-        required: false
-        default: '6.13.0'
+        description: 'xfsprogs 版本（示例 6.19.0）'
+        required: true
       ntfs3g_version:
-        description: 'ntfs-3g 版本（默认 2022.10.3）'
-        required: false
-        default: '2022.10.3'
+        description: 'ntfs-3g 版本（示例 2026.7.7）'
+        required: true
 
 jobs:
   build:
