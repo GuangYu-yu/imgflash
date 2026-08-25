@@ -401,11 +401,13 @@ jobs:
           # devmapper（LVM2 libdm）全部来自本流水线的静态库，杜绝 glibc 泄漏
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
           # musl 不支持 glibc 的 backtrace()/execinfo.h，必须显式关闭
+          # libudev 在 initramfs 中不是必须依赖，关闭可避免 findlib 报错
           ./configure \
             --prefix="$PREFIX" \
             --disable-shared \
             --disable-documentation \
             --disable-backtrace \
+            --disable-libudev \
             --disable-convert \
             --disable-lzo \
             --disable-zstd \
