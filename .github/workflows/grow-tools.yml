@@ -371,13 +371,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           DEST="binaries/${ARCH_DIR}/grow"
           mkdir -p "$DEST"
+          # 只发布独立二进制（musl 全静态，无需任何运行时库）
+          # prefix 里的 .a 静态库和头文件是构建中间产物，不入库
           cp -f "$OUT"/* "$DEST/"
-          # 依赖库随产物一起入库，增量构建（如只更新 xfsprogs）时恢复到 prefix/
-          rm -rf "$DEST/libs"
-          if compgen -G "$PREFIX/lib/*" > /dev/null; then
-            mkdir -p "$DEST/libs"
-            cp -a "$PREFIX/lib" "$PREFIX/include" "$DEST/libs/"
-          fi
           git add "$DEST"
           if git diff --cached --quiet; then
             echo "No changes to commit"
