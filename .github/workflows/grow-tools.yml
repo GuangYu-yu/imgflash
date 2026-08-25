@@ -139,7 +139,7 @@ jobs:
           V_LVM:  ${{ github.event.inputs.lvm2_version }}
         run: |
           set -euo pipefail
-          dl() { echo "FETCH $1"; curl -Lf --retry 3 -o "$1" "$2"; }
+          dl() { echo "FETCH $1 -> $2"; curl -Lf --retry 3 -o "$1" "$2"; }
           cd "$SRC/.."
           pids=""
           if [[ "$BUILD_UTIL" == "1" ]]; then
