@@ -16,15 +16,15 @@ on:
         description: 'ntfs-3g 版本（示例 2026.7.7）'
         required: false
       btrfs_progs_version:
-        description: 'btrfs-progs 版本（示例 6.16）'
+        description: 'btrfs-progs 版本（示例 7.0）'
         required: false
       lvm2_version:
-        description: 'LVM2 版本（示例 2.03.34）'
+        description: 'LVM2 版本（示例 2.03.42）'
         required: false
 
 env:
   # xfsprogs 的两个硬依赖，随流水线统一升级，不作为输入
-  INIH_VERSION: "58"
+  INIH_VERSION: "61"
   URCU_VERSION: "0.15.3"
   # btrfs-progs / LVM2 的硬依赖，同样固定
   ZLIB_VERSION: "1.3.1"
