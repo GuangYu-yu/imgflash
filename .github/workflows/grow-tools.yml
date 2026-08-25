@@ -142,15 +142,15 @@ jobs:
           musl-gcc ${HOST_CFLAGS} -c ini.c -o ini.o
           ar rcs "$PREFIX/lib/libinih.a" ini.o
           cp ini.h "$PREFIX/include/"
-          cat > "$PREFIX/lib/pkgconfig/inih.pc" <<'PKGEOF'
-prefix=__PREFIX__
-Name: inih
-Description: simple INI parser
-Version: 58
-Libs: -L${prefix}/lib -linih
-Cflags: -I${prefix}/include
-PKGEOF
-          sed -i "s|__PREFIX__|$PREFIX|g" "$PREFIX/lib/pkgconfig/inih.pc"
+          pc="$PREFIX/lib/pkgconfig/inih.pc"
+          {
+            printf 'prefix=%s\n' "$PREFIX"
+            echo 'Name: inih'
+            echo 'Description: simple INI parser'
+            echo 'Version: 58'
+            echo 'Libs: -L${prefix}/lib -linih'
+            echo 'Cflags: -I${prefix}/include'
+          } > "$pc"
 
       - name: 编译 util-linux
         if: env.BUILD_UTIL == '1'
