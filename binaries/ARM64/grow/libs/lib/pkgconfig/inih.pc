@@ -1,6 +1,0 @@
-prefix=/home/runner/work/imgflash/imgflash/prefix
-Name: inih
-Description: simple INI parser
-Version: 58
-Libs: -L${prefix}/lib -linih
-Cflags: -I${prefix}/include
