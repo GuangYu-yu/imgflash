@@ -56,10 +56,11 @@ impl Default for GrowPolicy {
     }
 }
 
-/// grow.conf 路径复用 init.rs 既有安装介质挂载点（与 image.squashfs 同源），
+/// grow.conf 与工具同住 ISO 根 /grow/，随 fast path 每次构建注入；
+/// 路径复用 init.rs 既有安装介质挂载点（与 image.squashfs 同源），
 /// 不为 grow 自建介质发现逻辑；介质缺席 → disabled
 pub fn load_policy() -> GrowPolicy {
-    load_policy_from(&Path::new(BOOT_MEDIA_DIR).join("grow.conf"))
+    load_policy_from(&Path::new(BOOT_MEDIA_DIR).join("grow/grow.conf"))
 }
 
 /// 解析契约：未知键忽略；已知键缺失用默认；值非法回退 auto（fail-open 到安全默认）
@@ -588,14 +589,15 @@ impl Status {
     }
 }
 
-// 工具路径（存在性守卫与 spawn 用同一来源）
-const SFDISK: &str = "/usr/bin/sfdisk";
-const MKSWAP: &str = "/usr/bin/mkswap";
-const PARTX: &str = "/usr/bin/partx";
-const E2FSCK: &str = "/usr/bin/e2fsck";
-const RESIZE2FS: &str = "/usr/bin/resize2fs";
-const XFS_GROWFS: &str = "/usr/bin/xfs_growfs";
-const NTFSRESIZE: &str = "/usr/bin/ntfsresize";
+// 工具路径（存在性守卫与 spawn 用同一来源）。工具不进 initramfs，随 fast path
+// 注入 ISO 根 /grow/；挂载仅 MS_RDONLY 不含 noexec，静态 musl 二进制可直接执行
+const SFDISK: &str = "/media/cdrom/grow/sfdisk";
+const MKSWAP: &str = "/media/cdrom/grow/mkswap";
+const PARTX: &str = "/media/cdrom/grow/partx";
+const E2FSCK: &str = "/media/cdrom/grow/e2fsck";
+const RESIZE2FS: &str = "/media/cdrom/grow/resize2fs";
+const XFS_GROWFS: &str = "/media/cdrom/grow/xfs_growfs";
+const NTFSRESIZE: &str = "/media/cdrom/grow/ntfsresize";
 
 /// 原子写（write-to-tmp + rename，同 /run tmpfs 内 rename 原子），
 /// 杜绝 TUI 读到 truncate 后的空帧/半帧

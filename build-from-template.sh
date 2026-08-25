@@ -227,11 +227,47 @@ echo "  Phase 1 完成。"
 # =============================================================================
 echo ""; echo "[Phase 2] 从模板构建 ISO ..."
 
-# grow.conf 每次构建可变（运行策略）——映射进 ISO 根；initramfs 能力已由模板定型
+# grow 全家桶（conf + 工具 + 许可证）注入 ISO 根 /grow/——与 image.squashfs 同为
+# 每次构建可变内容；initramfs 只保留 grow 逻辑与 xfs.ko（模板期定型）
 GROW_MAP_ARGS=()
 if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
-    printf 'enabled=1\npart=%s\n' "${GROW_PART:-auto}" > "${BUILD_DIR}/grow.conf"
-    GROW_MAP_ARGS=(-map "${BUILD_DIR}/grow.conf" /grow.conf)
+    GROW_BIN_DIR="${SCRIPT_DIR}/binaries/${ARCH^^}/grow"
+    [[ -d "${GROW_BIN_DIR}" ]] || die "GROW_ENABLED=1 但缺少 ${GROW_BIN_DIR}，请先运行 grow-tools workflow"
+
+    GROW_STAGE="${BUILD_DIR}/grow"
+    mkdir -p "${GROW_STAGE}"
+    printf 'enabled=1\npart=%s\n' "${GROW_PART:-auto}" > "${GROW_STAGE}/grow.conf"
+
+    # 精确条目匹配（不用 *ext4* 子串——会误配 ext4foo 之类）
+    grow_tool_enabled() {
+        tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq "$1"
+    }
+
+    for t in sfdisk mkswap partx; do
+        [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "grow 基础工具 ${t} 缺失"
+        cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
+    done
+    if grow_tool_enabled ext4; then
+        for t in e2fsck resize2fs; do
+            [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "GROW_TOOLS=ext4 但 ${t} 缺失"
+            cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
+        done
+    fi
+    if grow_tool_enabled xfs; then
+        [[ -f "${GROW_BIN_DIR}/xfs_growfs" ]] || die "GROW_TOOLS=xfs 但 xfs_growfs 缺失"
+        cp "${GROW_BIN_DIR}/xfs_growfs" "${GROW_STAGE}/"
+    fi
+    if grow_tool_enabled ntfs; then
+        [[ -f "${GROW_BIN_DIR}/ntfsresize" ]] || die "GROW_TOOLS=ntfs 但 ntfsresize 缺失"
+        cp "${GROW_BIN_DIR}/ntfsresize" "${GROW_STAGE}/"
+    fi
+
+    [[ -f "${GROW_BIN_DIR}/LICENSES.txt" ]] || die "grow LICENSES.txt 缺失（应随 grow-tools workflow 生成）"
+    cp "${GROW_BIN_DIR}/LICENSES.txt" "${GROW_STAGE}/"
+
+    GROW_MAP_ARGS=(-map "${GROW_STAGE}" /grow)
+
+    # 粗粒度 fail-fast：覆盖值必须真实存在（sfdisk 对镜像文件可用）
     if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then
         sfdisk -d "${IMAGE_PATH}" 2>/dev/null | grep -q "image.img${GROW_PART} :" \
             || die "GROW_PART=${GROW_PART} 在镜像中不存在"
