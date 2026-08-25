@@ -32,13 +32,13 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      # 1. Prepare workspace
-      - name: Checkout
+      # 1. 准备工作区
+      - name: 检出
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install toolchain
+      - name: 安装工具链
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -58,8 +58,8 @@ jobs:
             echo "ARCH_DIR=${{ matrix.arch_dir }}"
           } >> "$GITHUB_ENV"
 
-      # 2. Restore current artifacts (增量构建核心概念)
-      - name: Restore baseline
+      # 2. 恢复产物基线（增量构建前置条件）
+      - name: 恢复基线
         run: |
           set -euo pipefail
           if [[ -d "binaries/${ARCH_DIR}/grow" ]]; then
@@ -67,8 +67,8 @@ jobs:
             ls -1 "$OUT"
           fi
 
-      # 3. Calculate build plan
-      - name: Build plan
+      # 3. 计算构建计划
+      - name: 计算计划
         env:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
@@ -101,8 +101,8 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "plan: U=$U E=$E X=$X N=$N inih=$I lic=$L bins=[$BINS]"
 
-      # 4. Fetch sources
-      - name: Fetch sources
+      # 4. 下载源码
+      - name: 下载源码
         env:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
@@ -132,8 +132,8 @@ jobs:
           [[ "$NEED_INIH"  == "1" ]] && { tar -xf inih.tar.gz -C "$SRC"; mv "$SRC/inih-r58" "$SRC/inih"; }
           ls -1 "$SRC"
 
-      # 5. Build
-      - name: Build inih
+      # 5. 编译
+      - name: 编译 inih
         if: env.NEED_INIH == '1'
         run: |
           set -euo pipefail
@@ -142,16 +142,17 @@ jobs:
           musl-gcc ${HOST_CFLAGS} -c ini.c -o ini.o
           ar rcs "$PREFIX/lib/libinih.a" ini.o
           cp ini.h "$PREFIX/include/"
-          cat > "$PREFIX/lib/pkgconfig/inih.pc" <<EOF
-          prefix=$PREFIX
-          Name: inih
-          Description: simple INI parser
-          Version: 58
-          Libs: -L\${prefix}/lib -linih
-          Cflags: -I\${prefix}/include
-          EOF
+          cat > "$PREFIX/lib/pkgconfig/inih.pc" <<'PKGEOF'
+prefix=__PREFIX__
+Name: inih
+Description: simple INI parser
+Version: 58
+Libs: -L${prefix}/lib -linih
+Cflags: -I${prefix}/include
+PKGEOF
+          sed -i "s|__PREFIX__|$PREFIX|g" "$PREFIX/lib/pkgconfig/inih.pc"
 
-      - name: Build util-linux
+      - name: 编译 util-linux
         if: env.BUILD_UTIL == '1'
         env:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
@@ -161,20 +162,23 @@ jobs:
           export CPPFLAGS="${HOST_CPPFLAGS}"
           export CFLAGS="${HOST_CFLAGS}"
           cd "$SRC/util-linux-${V_UTIL}"
+          # util-linux 2.41 --disable-all-programs 后单个程序不再用 --enable-xxx
+          # （configure 会报 unrecognized），必须 make <target>。libxxx 仍然要
+          # --enable-* 开启，因为它们是 xfsprogs 静态链接依赖。
           ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static \
             --disable-all-programs \
-            --enable-sfdisk --enable-mkswap --enable-partx \
             --enable-libblkid --enable-libuuid --enable-libfdisk --enable-libsmartcols \
             --without-python --without-systemd --without-systemdsystemunitdir \
             --disable-bash-completion \
             CPPFLAGS="${CPPFLAGS}" CFLAGS="${CFLAGS}" LDFLAGS=-static
-          make -j"$(nproc)"
-          make install
-          cp "$PREFIX/sbin/sfdisk" "$PREFIX/sbin/mkswap" "$PREFIX/sbin/partx" "$OUT/"
+          make -j"$(nproc)" sfdisk mkswap partx
+          for t in sfdisk mkswap partx; do
+            find . -name "$t" -type f -perm -u+x | head -1 | xargs -I{} cp {} "$OUT/"
+          done
 
-      - name: Build e2fsprogs
+      - name: 编译 e2fsprogs
         if: env.BUILD_E2FS == '1'
         env:
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
@@ -189,7 +193,7 @@ jobs:
           find build -name e2fsck   -type f | head -1 | xargs -I{} cp {} "$OUT/"
           find build -name resize2fs -type f | head -1 | xargs -I{} cp {} "$OUT/"
 
-      - name: Build xfsprogs
+      - name: 编译 xfsprogs
         if: env.BUILD_XFS == '1'
         env:
           V_XFS: ${{ github.event.inputs.xfsprogs_version }}
@@ -206,7 +210,7 @@ jobs:
           make -j"$(nproc)" xfs_growfs
           find . -name xfs_growfs -type f -perm -u+x | head -1 | xargs -I{} cp {} "$OUT/"
 
-      - name: Build ntfs-3g
+      - name: 编译 ntfs-3g
         if: env.BUILD_NTFS == '1'
         env:
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
@@ -220,8 +224,8 @@ jobs:
           make -j"$(nproc)" ntfsresize
           find . -name ntfsresize -type f -perm -u+x | head -1 | xargs -I{} cp {} "$OUT/"
 
-      # 6. Validate merged artifact set
-      - name: Validate artifacts
+      # 6. 校验合并产物
+      - name: 校验产物
         run: |
           set -euo pipefail
           cd "$OUT"
@@ -239,7 +243,7 @@ jobs:
           done
           ls -lh
 
-      - name: Write LICENSES
+      - name: 生成 LICENSES
         env:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
@@ -289,8 +293,8 @@ jobs:
           } > LICENSES.txt
           wc -l LICENSES.txt
 
-      # 7. Publish
-      - name: Publish
+      # 7. 发布
+      - name: 发布
         env:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
