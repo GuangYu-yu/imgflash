@@ -1,0 +1,213 @@
+name: "构建 grow 静态工具链"
+
+on:
+  workflow_dispatch:
+    inputs:
+      util_linux_version:
+        description: 'util-linux 版本（示例 2.41.5）'
+        required: true
+      e2fsprogs_version:
+        description: 'e2fsprogs 版本（示例 1.47.4）'
+        required: true
+      xfsprogs_version:
+        description: 'xfsprogs 版本（示例 7.1.1）'
+        required: true
+      ntfs3g_version:
+        description: 'ntfs-3g 版本（示例 2026.7.7）'
+        required: true
+
+jobs:
+  build:
+    name: "编译 ${{ matrix.arch_dir }}"
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - arch_dir: AMD64
+            runner: ubuntu-latest
+          - arch_dir: ARM64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: "检出仓库"
+        uses: actions/checkout@v4
+
+      - name: "安装 musl 工具链"
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: "下载源码"
+        env:
+          UTIL_LINUX_VERSION: ${{ github.event.inputs.util_linux_version }}
+          E2FSPROGS_VERSION: ${{ github.event.inputs.e2fsprogs_version }}
+          XFSPROGS_VERSION: ${{ github.event.inputs.xfsprogs_version }}
+          NTFS3G_VERSION: ${{ github.event.inputs.ntfs3g_version }}
+        run: |
+          set -e
+          curl -Lf --retry 3 -o util-linux.tar.xz \
+            "https://www.kernel.org/pub/linux/utils/util-linux/v${UTIL_LINUX_VERSION%.*}/util-linux-${UTIL_LINUX_VERSION}.tar.xz"
+          curl -Lf --retry 3 -o e2fsprogs.tar.gz \
+            "https://downloads.sourceforge.net/project/e2fsprogs/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz"
+          curl -Lf --retry 3 -o xfsprogs.tar.gz \
+            "https://www.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${XFSPROGS_VERSION}.tar.gz"
+          curl -Lf --retry 3 -o ntfs-3g.tar.gz \
+            "https://github.com/tuxera/ntfs-3g/archive/refs/tags/${NTFS3G_VERSION}.tar.gz"
+          curl -Lf --retry 3 -o inih.tar.gz \
+            "https://github.com/benhoyt/inih/archive/refs/tags/r58.tar.gz"
+          mkdir -p src out
+          tar -xf util-linux.tar.xz -C src
+          tar -xf e2fsprogs.tar.gz -C src
+          tar -xf xfsprogs.tar.gz -C src
+          tar -xf ntfs-3g.tar.gz -C src
+          tar -xf inih.tar.gz -C src
+          mv src/inih-r58 src/inih
+
+      - name: "编译 util-linux（sfdisk/mkswap/partx + 静态库，xfsprogs 依赖前置）"
+        env:
+          UTIL_LINUX_VERSION: ${{ github.event.inputs.util_linux_version }}
+        run: |
+          set -e
+          PREFIX="$PWD/prefix"
+          export CC=musl-gcc
+          cd "src/util-linux-${UTIL_LINUX_VERSION}"
+          ./configure \
+            --prefix="$PREFIX" \
+            --disable-shared --enable-static \
+            --disable-all-programs \
+            --enable-sfdisk --enable-mkswap --enable-partx \
+            --enable-libblkid --enable-libuuid --enable-libfdisk --enable-libsmartcols \
+            --without-python --without-systemd --without-systemdsystemunitdir \
+            --disable-bash-completion \
+            LDFLAGS=-static
+          make -j$(nproc)
+          make install
+          cp "$PREFIX/sbin/sfdisk" "$PREFIX/sbin/mkswap" "$PREFIX/sbin/partx" ../out/
+          # xfsprogs 后续链接用
+          echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"
+
+      - name: "编译 e2fsprogs（e2fsck/resize2fs）"
+        env:
+          E2FSPROGS_VERSION: ${{ github.event.inputs.e2fsprogs_version }}
+        run: |
+          set -e
+          cd "src/e2fsprogs-${E2FSPROGS_VERSION}"
+          mkdir -p build && cd build
+          ../configure --prefix="$PWD/sysroot" CC=musl-gcc LDFLAGS=-static
+          make -j$(nproc) e2fsck resize2fs
+          cp misc/e2fsck ../out_e2fsck 2>/dev/null || cp e2fsck ../out_e2fsck 2>/dev/null || true
+          cd ..
+          find build -name e2fsck -type f | head -1 | xargs -I{} cp {} ../out/
+          find build -name resize2fs -type f | head -1 | xargs -I{} cp {} ../out/
+
+      - name: "编译 inih（xfsprogs 依赖）"
+        run: |
+          set -e
+          cd src/inih
+          musl-gcc -c ini.c -o ini.o
+          ar rcs "$PREFIX/lib/libinih.a" ini.o
+          cp ini.h "$PREFIX/include/"
+          # 供 pkg-config 检测的 .pc
+          cat > "$PREFIX/lib/pkgconfig/inih.pc" <<EOF
+          Name: inih
+          Description: simple INI parser
+          Version: 58
+          Libs: -L$PREFIX/lib -linih
+          Cflags: -I$PREFIX/include
+          EOF
+
+      - name: "编译 xfsprogs（xfs_growfs）"
+        env:
+          XFSPROGS_VERSION: ${{ github.event.inputs.xfsprogs_version }}
+        run: |
+          set -e
+          cd "src/xfsprogs-${XFSPROGS_VERSION}"
+          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+          export CFLAGS="-I$PREFIX/include"
+          ./configure --prefix="$PREFIX" CC=musl-gcc \
+            LDFLAGS="-static -L$PREFIX/lib" \
+            --disable-shared
+          make -j$(nproc) xfs_growfs
+          find . -name xfs_growfs -type f -perm -u+x | head -1 | xargs -I{} cp {} ../out/
+
+      - name: "编译 ntfs-3g（ntfsresize）"
+        env:
+          NTFS3G_VERSION: ${{ github.event.inputs.ntfs3g_version }}
+        run: |
+          set -e
+          cd "src/ntfs-3g-${NTFS3G_VERSION}"
+          ./configure --prefix="$PWD/sysroot" CC=musl-gcc \
+            LDFLAGS=-static \
+            --disable-shared --enable-static --enable-ntfsprogs
+          make -j$(nproc) ntfsresize
+          find . -name ntfsresize -type f -perm -u+x | head -1 | xargs -I{} cp {} ../out/
+
+      - name: "校验静态链接 + strip"
+        run: |
+          set -e
+          cd out
+          for t in sfdisk mkswap partx e2fsck resize2fs xfs_growfs ntfsresize; do
+            [[ -x "$t" ]] || { echo "ERROR: $t 未产出"; exit 1; }
+            file "$t" | grep -q "statically linked" || { echo "ERROR: $t 非静态链接"; file "$t"; exit 1; }
+          done
+          strip --strip-all sfdisk mkswap partx e2fsck resize2fs xfs_growfs ntfsresize
+          ls -lh
+
+      - name: "生成 LICENSES.txt（GPL 随附义务）"
+        env:
+          UTIL_LINUX_VERSION: ${{ github.event.inputs.util_linux_version }}
+          E2FSPROGS_VERSION: ${{ github.event.inputs.e2fsprogs_version }}
+          XFSPROGS_VERSION: ${{ github.event.inputs.xfsprogs_version }}
+          NTFS3G_VERSION: ${{ github.event.inputs.ntfs3g_version }}
+        run: |
+          set -e
+          cd out
+          {
+            echo "ImgFlash grow 静态工具链许可证说明"
+            echo "================================"
+            echo "以下工具以 musl 静态链接构建，与 ImgFlash（MIT）为 mere aggregation（独立程序经 spawn 调用，非链接）。"
+            echo "各二进制整体按 GPL-2.0-or-later 分发；完整源码获取方式 = 本仓库 .github/workflows/grow-tools.yml（含精确版本号与构建配方）。"
+            echo ""
+            for spec in \
+              "util-linux ${UTIL_LINUX_VERSION} https://www.kernel.org/pub/linux/utils/util-linux/v${UTIL_LINUX_VERSION%.*}/util-linux-${UTIL_LINUX_VERSION}.tar.xz" \
+              "e2fsprogs ${E2FSPROGS_VERSION} https://downloads.sourceforge.net/project/e2fsprogs/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz" \
+              "xfsprogs ${XFSPROGS_VERSION} https://www.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${XFSPROGS_VERSION}.tar.gz" \
+              "ntfs-3g ${NTFS3G_VERSION} https://github.com/tuxera/ntfs-3g/archive/refs/tags/${NTFS3G_VERSION}.tar.gz"; do
+              set -- $spec
+              echo "## $1 $2"
+              echo "源码: $3"
+              echo ""
+            done
+            echo "许可证全文（上游 COPYING）："
+            echo ""
+            echo "===== util-linux COPYING (GPL-2.0+) ====="
+            curl -Lf --retry 3 "https://raw.githubusercontent.com/util-linux/util-linux/v${UTIL_LINUX_VERSION}/COPYING"
+            echo ""
+            echo "===== e2fsprogs COPYING (GPL-2.0) ====="
+            curl -Lf --retry 3 "https://raw.githubusercontent.com/tytso/e2fsprogs/v${E2FSPROGS_VERSION}/COPYING"
+            echo ""
+            echo "===== xfsprogs LICENSE (GPL-2.0) ====="
+            curl -Lf --retry 3 "https://git.kernel.org/pub/scm/fs/xfs/xfsprogs-dev.git/plain/copying?h=v${XFSPROGS_VERSION}"
+            echo ""
+            echo "===== ntfs-3g COPYING (GPL-2.0+) ====="
+            curl -Lf --retry 3 "https://raw.githubusercontent.com/tuxera/ntfs-3g/${NTFS3G_VERSION}/COPYING"
+          } > LICENSES.txt
+          wc -l LICENSES.txt
+
+      - name: "提交产物"
+        env:
+          UTIL_LINUX_VERSION: ${{ github.event.inputs.util_linux_version }}
+          E2FSPROGS_VERSION: ${{ github.event.inputs.e2fsprogs_version }}
+          XFSPROGS_VERSION: ${{ github.event.inputs.xfsprogs_version }}
+          NTFS3G_VERSION: ${{ github.event.inputs.ntfs3g_version }}
+          ARCH_DIR: ${{ matrix.arch_dir }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p "binaries/${ARCH_DIR}/grow"
+          cp out/* "binaries/${ARCH_DIR}/grow/"
+          git add "binaries/${ARCH_DIR}/grow/"
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "chore: update grow tools ${ARCH_DIR} (util-linux ${UTIL_LINUX_VERSION}, e2fsprogs ${E2FSPROGS_VERSION}, xfsprogs ${XFSPROGS_VERSION}, ntfs-3g ${NTFS3G_VERSION})"
+          git pull --rebase || true
+          git push
