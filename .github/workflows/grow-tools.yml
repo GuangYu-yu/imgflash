@@ -355,6 +355,10 @@ jobs:
           cd "$SRC/LVM2.${V_LVM}"
           # Alpine APKBUILD 同款配置：--enable-static_link 让 lvm 链 -static；
           # dmeventd/cmdlib/udev/selinux 都是运行时服务侧功能，initramfs 不需要
+          echo "=== 检查 linux 头文件 ==="
+          ls -l /usr/include/linux/types.h || echo "WARNING: /usr/include/linux/types.h 不存在"
+          echo "HOST_CPPFLAGS=$HOST_CPPFLAGS"
+          echo "HOST_CFLAGS=$HOST_CFLAGS"
           ./configure \
             --prefix="$PREFIX" \
             --enable-static_link \
