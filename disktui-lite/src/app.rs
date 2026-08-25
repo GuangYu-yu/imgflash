@@ -258,7 +258,6 @@ pub struct App {
 }
 
 impl App {
-    pub const IMAGE_FILE: &'static str = "/image/image.img";
     const REBOOT_SECONDS: u8 = 5;
     /// TUI 主循环 tick 间隔（100ms）——main 轮询与进度速度换算的单一来源
     pub const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -317,11 +316,11 @@ impl App {
     }
 
     pub fn image_file_size(&self) -> Option<u64> {
-        std::fs::metadata(Self::IMAGE_FILE).ok().map(|m| m.len())
+        std::fs::metadata(crate::utils::IMAGE_FILE).ok().map(|m| m.len())
     }
 
     pub fn image_exists(&self) -> bool {
-        std::path::Path::new(Self::IMAGE_FILE).exists()
+        std::path::Path::new(crate::utils::IMAGE_FILE).exists()
     }
 
     // ── Tick ────────────────────────────────────────────────────────────

@@ -207,7 +207,7 @@ fn start_write(app: &mut App) -> anyhow::Result<()> {
     // Spawn self as dd subprocess
     let child = std::process::Command::new("/proc/self/exe")
         .arg("--dd")
-        .arg(format!("if={}", App::IMAGE_FILE))
+        .arg(format!("if={}", crate::utils::IMAGE_FILE))
         .arg(format!("of=/dev/{}", disk.name))
         .arg("bs=4M")
         .arg("conv=fsync,sparse")

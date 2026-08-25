@@ -3,12 +3,8 @@ use ratatui::style::Color;
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub focus_border: Color,
-    pub normal_border: Color,
-    pub highlight_bg: Color,
-    pub highlight_fg: Color,
     pub header: Color,
     pub error: Color,
-    pub warning: Color,
     pub success: Color,
 
     pub disk_name_width: u16,
@@ -25,12 +21,8 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             focus_border: Color::Indexed(2),
-            normal_border: Color::Reset,
-            highlight_bg: Color::Indexed(8),
-            highlight_fg: Color::Reset,
             header: Color::Indexed(3),
             error: Color::Indexed(1),
-            warning: Color::Indexed(3),
             success: Color::Indexed(2),
 
             disk_name_width: 10,

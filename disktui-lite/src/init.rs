@@ -9,11 +9,12 @@ use std::path::Path;
 
 use anyhow::bail;
 
+use crate::utils::{BOOT_MEDIA_DIR, IMAGE_FILE};
+
 // ── Constants ───────────────────────────────────────────────────────────
 
 const MAX_SCAN_TRIES: u32 = 10;
 const SCAN_INTERVAL_SECS: u64 = 1;
-pub(crate) const BOOT_MEDIA_DIR: &str = "/media/cdrom";
 const IMAGE_DIR: &str = "/image";
 const SQUASHFS_FILE: &str = "/media/cdrom/image.squashfs";
 const DEVICE_PREFIXES: [&str; 6] = ["sr", "sd", "nvme", "vd", "hd", "mmcblk"];
@@ -259,7 +260,7 @@ fn mount_squashfs() -> bool {
 // ── Phase 6: Verify Image ───────────────────────────────────────────────
 
 fn verify_image() -> anyhow::Result<()> {
-    if !Path::new(crate::app::App::IMAGE_FILE).exists() {
+    if !Path::new(IMAGE_FILE).exists() {
         bail!("image.img not found in squashfs");
     }
     Ok(())

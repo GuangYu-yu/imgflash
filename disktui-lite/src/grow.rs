@@ -17,12 +17,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::utils::SECTOR;
-
-#[cfg(target_os = "linux")]
-use crate::init::BOOT_MEDIA_DIR;
-#[cfg(not(target_os = "linux"))]
-const BOOT_MEDIA_DIR: &str = "/media/cdrom";
+use crate::utils::{SECTOR, BOOT_MEDIA_DIR};
 
 // ── 常量 ────────────────────────────────────────────────────────────────
 pub const STATUS_FILE: &str = "/run/grow.status";
@@ -439,6 +434,11 @@ fn unsupported_reason(fs: FsKind) -> String {
     }
 }
 
+/// 可原地扩容的 fs 集合（单一来源：superfloppy / swap 手术 / 常规候选共用）
+fn is_growable(fs: FsKind) -> bool {
+    matches!(fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm)
+}
+
 /// 分区设备名：nvme/mmcblk 带 p 前缀（nvme0n1p3），其余直接拼接（sda3）
 pub fn part_dev_name(disk_name: &str, num: u32) -> String {
     if disk_name.starts_with("nvme") || disk_name.starts_with("mmcblk") {
@@ -464,22 +464,21 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &G
     // superfloppy：直达 fs 扩容，无分区步骤
     if table.label == Label::None {
         let fs = sniff_fs(&mut f, 0);
-        return match fs {
-            FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm => {
-                if fs == FsKind::Btrfs && btrfs_multi_device(&mut f, 0) {
-                    return skip("btrfs multi-device filesystem");
-                }
-                if let Some(fs_end) = fs_end_bytes(&mut f, 0)
-                    && fs_end + MIN_FREE_SECTORS * SECTOR >= device_sectors * SECTOR
-                {
-                    return skip("no free space after filesystem");
-                }
-                GrowPlan {
-                    action: Some(GrowAction::FilesystemOnly { fs, fs_dev: dev.display().to_string() }),
-                    skip_reason: None,
-                }
+        return if is_growable(fs) {
+            if fs == FsKind::Btrfs && btrfs_multi_device(&mut f, 0) {
+                return skip("btrfs multi-device filesystem");
             }
-            other => skip(&unsupported_reason(other)),
+            if let Some(fs_end) = fs_end_bytes(&mut f, 0)
+                && fs_end + MIN_FREE_SECTORS * SECTOR >= device_sectors * SECTOR
+            {
+                return skip("no free space after filesystem");
+            }
+            GrowPlan {
+                action: Some(GrowAction::FilesystemOnly { fs, fs_dev: dev.display().to_string() }),
+                skip_reason: None,
+            }
+        } else {
+            skip(&unsupported_reason(fs))
         };
     }
 
@@ -523,7 +522,7 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &G
         if prev_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, prev.first_lba * SECTOR) {
             return skip("btrfs multi-device filesystem");
         }
-        if !matches!(prev_fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm) {
+        if !is_growable(prev_fs) {
             return skip("swap last, no growable partition before it");
         }
         let Some(si) = read_swap_info(&mut f, last.first_lba * SECTOR) else {
@@ -544,7 +543,7 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &G
         (prev, Some(plan))
     } else if last.is_container {
         return skip("MBR logical/extended not supported in v1");
-    } else if matches!(last_fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm) {
+    } else if is_growable(last_fs) {
         (last.clone(), None)
     } else {
         return skip(&unsupported_reason(last_fs));
@@ -855,7 +854,6 @@ fn tools_missing(fs: FsKind, need: ToolNeed) -> Option<String> {
 struct MountedGrow {
     fstype: &'static str,
     module: &'static str,
-    display_name: &'static str,
     tool: &'static str,
     args: &'static [&'static str],
     mount_err: &'static str,
@@ -865,7 +863,6 @@ struct MountedGrow {
 const XFS_GROW: MountedGrow = MountedGrow {
     fstype: "xfs",
     module: "xfs",
-    display_name: "XFS",
     tool: XFS_GROWFS,
     args: &["-d", GROW_MNT],
     mount_err: "XFS kernel support unavailable",
@@ -875,7 +872,6 @@ const XFS_GROW: MountedGrow = MountedGrow {
 const BTRFS_GROW: MountedGrow = MountedGrow {
     fstype: "btrfs",
     module: "btrfs",
-    display_name: "Btrfs",
     tool: BTRFS,
     args: &["filesystem", "resize", "max", GROW_MNT],
     mount_err: "Btrfs kernel support unavailable",
@@ -907,7 +903,7 @@ fn grow_mounted_fs(ctx: &GrowCtx, target: &str, spec: &MountedGrow) -> Result<()
     {
         // Linux-only 项目：非 linux 路径仅为占位，显式丢弃其余参数
         let _ = (ctx, target);
-        Err(format!("{} grow requires Linux", spec.display_name))
+        Err(format!("{} grow requires Linux", spec.fstype))
     }
 }
 
@@ -972,7 +968,7 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     }
 
     // 2) PV 所属 VG
-    let Some((code, vg_out)) = ctx.run_capture(LVM, &["pvs", "--noheadings", "-o", "vg_name", target]) else {
+    let Some((code, vg_out)) = ctx.run_capture(&tool_path(LVM), &["pvs", "--noheadings", "-o", "vg_name", target]) else {
         return Err("lvm spawn failed".into());
     };
     if code != 0 {
@@ -984,7 +980,7 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     }
 
     // 3) VG 内 LV 清单：仅唯一 LV 自动扩（多 LV 目标选择是用户决策，不猜）
-    let Some((code, lvs_out)) = ctx.run_capture(LVM, &["lvs", "--noheadings", "-o", "lv_name", &vg]) else {
+    let Some((code, lvs_out)) = ctx.run_capture(&tool_path(LVM), &["lvs", "--noheadings", "-o", "lv_name", &vg]) else {
         return Err("lvm spawn failed".into());
     };
     if code != 0 {
@@ -1014,7 +1010,7 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
 
     // 6) 解析 dm 设备节点（/dev/<vg>/<lv> 是 udev 符号链接，此处不存在；
     //    dm_path 给出真实节点 /dev/mapper/<vg>-<lv>，含转义规则处理）
-    let Some((code, dm_out)) = ctx.run_capture(LVM, &["lvs", "--noheadings", "-o", "dm_path", &lv_path]) else {
+    let Some((code, dm_out)) = ctx.run_capture(&tool_path(LVM), &["lvs", "--noheadings", "-o", "dm_path", &lv_path]) else {
         return Err("lvm spawn failed".into());
     };
     if code != 0 {

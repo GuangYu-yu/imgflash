@@ -173,8 +173,7 @@ impl DiskInfo {
                 {
                     let is_match = dev_name == name
                         || dev_name.strip_prefix(name).is_some_and(|suffix| {
-                            let first_char = suffix.chars().next().unwrap();
-                            first_char.is_ascii_digit() || first_char == 'p'
+                            suffix.chars().next().is_some_and(|c| c.is_ascii_digit() || c == 'p')
                         });
 
                     if is_match {
