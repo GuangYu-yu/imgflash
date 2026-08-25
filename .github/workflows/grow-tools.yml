@@ -353,25 +353,32 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/LVM2.${V_LVM}"
-          # Alpine APKBUILD 同款配置：--enable-static_link 让 lvm 链 -static；
-          # dmeventd/cmdlib/udev/selinux 都是运行时服务侧功能，initramfs 不需要
           MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+          # musl-gcc 会通过 specs 覆盖默认 include 路径；
+          # LVM2/libdm 的 libdevmapper.h 需要 linux/types.h。
+          # Ubuntu 的 linux-libc-dev 提供 /usr/include/linux 和
+          # /usr/include/${MULTIARCH}/asm 等 userspace kernel headers。
+          export CPPFLAGS="-I/usr/include -I/usr/include/${MULTIARCH} -I/usr/include/asm-generic -I$PREFIX/include"
+          export CFLAGS="${HOST_CFLAGS} -I$PREFIX/include"
+          export LDFLAGS="-static -L$PREFIX/lib"
+          # 先确认 musl-gcc 能看到 Linux kernel userspace headers。
+          test -f /usr/include/linux/types.h
+          printf '#include <linux/types.h>\n' | musl-gcc ${CPPFLAGS} -E - >/dev/null
           ./configure \
             --prefix="$PREFIX" \
             --enable-static_link \
-            --disable-cmdlib --disable-dmeventd \
+            --disable-cmdlib \
+            --disable-dmeventd \
             --disable-udev_sync \
-            --disable-selinux --disable-nls \
+            --disable-selinux \
+            --disable-nls \
             --with-blkid=none \
             --with-systemdsystemunitdir=/dev/null \
-            CC=musl-gcc \
-            CPPFLAGS="-I/usr/include -I/usr/include/${MULTIARCH} -I/usr/include/asm-generic -I$PREFIX/include" \
-            CFLAGS="${HOST_CFLAGS} -I$PREFIX/include" \
-            LDFLAGS="-static -L$PREFIX/lib"
-          # 先 libdm：产 libdevmapper.a 进 prefix（btrfs-progs 也链接它）
+            CC=musl-gcc
+          # libdevmapper.a
           make -j"$(nproc)" device-mapper
           make install_device-mapper
-          # lvm 多调用二进制：运行期以 `lvm pvresize/lvs/lvextend/vgchange` 调用
+          # lvm
           make -j"$(nproc)" lvm
           cp tools/lvm "$OUT/lvm"
 
