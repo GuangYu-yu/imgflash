@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       util_linux_version:
-        description: 'util-linux 版本（示例 2.41.5；btrfs-progs 构建必须同时填写）'
+        description: 'util-linux 版本（示例 2.42.2；btrfs-progs 构建必须同时填写）'
         required: false
       e2fsprogs_version:
         description: 'e2fsprogs 版本（示例 1.47.4）'
