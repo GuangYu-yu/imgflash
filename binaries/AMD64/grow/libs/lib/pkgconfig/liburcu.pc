@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2023 EfficiOS Inc.
+#
+# SPDX-License-Identifier: MIT
+
+prefix=/home/runner/work/imgflash/imgflash/prefix
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: Userspace RCU 
+Description: A userspace RCU (read-copy-update) library, standard version
+Version: 0.15.3
+Requires:
+Libs: -L${libdir} -lurcu-common -lurcu
+Cflags: -I${includedir} 

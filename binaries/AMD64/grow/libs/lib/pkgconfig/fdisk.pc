@@ -1,0 +1,11 @@
+prefix=/home/runner/work/imgflash/imgflash/prefix
+exec_prefix=/home/runner/work/imgflash/imgflash/prefix
+libdir=/home/runner/work/imgflash/imgflash/prefix/lib
+includedir=/home/runner/work/imgflash/imgflash/prefix/include
+
+Name: fdisk
+Description: fdisk library
+Version: 2.41.5
+Requires.private: uuid blkid
+Cflags: -I${includedir}/libfdisk
+Libs: -L${libdir} -lfdisk
