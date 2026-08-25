@@ -30,6 +30,14 @@ on:
         description: '启用 Secure Boot'
         type: boolean
         default: false
+      auto_grow:
+        description: 'dd 后自动扩容末分区'
+        type: boolean
+        default: true
+      grow_part:
+        description: '指定扩容分区号（留空=自动取末分区）'
+        required: false
+        default: ''
       # use_tui:
       #   description: '使用 TUI'
       #   type: boolean
@@ -142,6 +150,14 @@ jobs:
       - name: "设置 Secure Boot"
         if: ${{ github.event.inputs.secure_boot == 'true' }}
         run: sed -i 's/^ENABLE_SECURE_BOOT=.*/ENABLE_SECURE_BOOT=1/' build.env
+
+      - name: "设置自动扩容"
+        if: ${{ github.event.inputs.auto_grow == 'false' }}
+        run: sed -i 's/^GROW_ENABLED=.*/GROW_ENABLED=0/' build.env
+
+      - name: "设置扩容分区覆盖"
+        if: ${{ github.event.inputs.grow_part != '' }}
+        run: sed -i "s/^GROW_PART=.*/GROW_PART=${{ github.event.inputs.grow_part }}/" build.env
 
       # - name: "设置安装器模式为 Shell"
       #   if: ${{ github.event.inputs.use_tui != 'true' }}
