@@ -23,6 +23,7 @@ jobs:
     permissions:
       contents: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - arch_dir: AMD64
@@ -34,10 +35,10 @@ jobs:
       - name: "检出仓库"
         uses: actions/checkout@v4
 
-      - name: "安装 musl 工具链"
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: "安装 musl 工具链 + 内核头（ARM64 runner 缺 linux-libc-dev）"
+        run: sudo apt-get update && sudo apt-get install -y musl-tools linux-libc-dev
 
-      - name: "下载源码"
+      - name: "下载源码（5 路并行 curl → 串行 tar）"
         env:
           UTIL_LINUX_VERSION: ${{ github.event.inputs.util_linux_version }}
           E2FSPROGS_VERSION: ${{ github.event.inputs.e2fsprogs_version }}
@@ -45,16 +46,30 @@ jobs:
           NTFS3G_VERSION: ${{ github.event.inputs.ntfs3g_version }}
         run: |
           set -e
+          # 5 路并行下载（互不依赖），任一路失败 set -e + wait exit code 会保 fail
           curl -Lf --retry 3 -o util-linux.tar.xz \
-            "https://www.kernel.org/pub/linux/utils/util-linux/v${UTIL_LINUX_VERSION%.*}/util-linux-${UTIL_LINUX_VERSION}.tar.xz"
+            "https://www.kernel.org/pub/linux/utils/util-linux/v${UTIL_LINUX_VERSION%.*}/util-linux-${UTIL_LINUX_VERSION}.tar.xz" &
+          PID1=$!
           curl -Lf --retry 3 -o e2fsprogs.tar.gz \
-            "https://downloads.sourceforge.net/project/e2fsprogs/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz"
+            "https://downloads.sourceforge.net/project/e2fsprogs/e2fsprogs/v${E2FSPROGS_VERSION}/e2fsprogs-${E2FSPROGS_VERSION}.tar.gz" &
+          PID2=$!
           curl -Lf --retry 3 -o xfsprogs.tar.gz \
-            "https://www.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${XFSPROGS_VERSION}.tar.gz"
+            "https://www.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${XFSPROGS_VERSION}.tar.gz" &
+          PID3=$!
           curl -Lf --retry 3 -o ntfs-3g.tar.gz \
-            "https://github.com/tuxera/ntfs-3g/archive/refs/tags/${NTFS3G_VERSION}.tar.gz"
+            "https://github.com/tuxera/ntfs-3g/archive/refs/tags/${NTFS3G_VERSION}.tar.gz" &
+          PID4=$!
           curl -Lf --retry 3 -o inih.tar.gz \
-            "https://github.com/benhoyt/inih/archive/refs/tags/r58.tar.gz"
+            "https://github.com/benhoyt/inih/archive/refs/tags/r58.tar.gz" &
+          PID5=$!
+          rc=0
+          wait $PID1 || rc=$?
+          wait $PID2 || rc=$?
+          wait $PID3 || rc=$?
+          wait $PID4 || rc=$?
+          wait $PID5 || rc=$?
+          [[ $rc -eq 0 ]] || { echo "ERROR: 并行下载中存在失败，exit=$rc"; exit $rc; }
+          # 解压仍是串行（I/O 密集型并行收益不大，且避免 tar 输出目录竞态）
           mkdir -p src out
           tar -xf util-linux.tar.xz -C src
           tar -xf e2fsprogs.tar.gz -C src
