@@ -293,11 +293,9 @@ jobs:
             for t in $EXPECTED_BINS; do
               [[ -x "$t" ]] || { echo "ERROR: $t 未产出"; exit 1; }
               file "$t" | grep -q "statically linked" || { echo "ERROR: $t 非静态链接"; file "$t"; exit 1; }
+              strip --strip-all "$t"
             done
           fi
-          for t in sfdisk mkswap partx e2fsck resize2fs xfs_growfs ntfsresize; do
-            [[ -x "$t" ]] && strip --strip-all "$t" || true
-          done
           ls -lh
 
       - name: 生成 LICENSES
