@@ -311,6 +311,14 @@ pub fn sniff_fs(dev: &mut dyn ReadSeek, part_offset: u64) -> FsKind {
     FsKind::Unknown
 }
 
+/// btrfs 多设备判定：超级块 @0x10000 的 num_devices 字段（相对偏移 0x88，u64 LE，
+/// 官方 On-disk Format 文档核实）。>1 表示多设备/RAID——`resize max` 语义按 devid
+/// 分配，不能一次到位，跳过（分区扩容本身安全，fs 层留给用户手动处理）
+fn btrfs_multi_device(dev: &mut dyn ReadSeek, part_offset: u64) -> bool {
+    let mut sb = [0u8; 0x90];
+    read_at(dev, part_offset + 0x10000, &mut sb) == 0x90 && le64(&sb[0x88..0x90]) > 1
+}
+
 /// swap 头（v1）：UUID @1036、label @1052，魔数在页尾（4086/8186 按页大小）
 pub struct SwapInfo {
     pub uuid: String,
@@ -336,6 +344,11 @@ fn fs_end_bytes(dev: &mut dyn ReadSeek, offset: u64) -> Option<u64> {
     let sb = &sb[..n];
     if sb.len() < 0x40 {
         return None;
+    }
+    // btrfs：超级块 @+0x10000（不在开头 1KB 内），total_bytes u64@0x70（官方 On-disk Format）
+    let mut bsb = [0u8; 0x78];
+    if read_at(dev, offset + 0x10000, &mut bsb) == 0x78 && magic(&bsb, 0x40, b"_BHRfS_M") {
+        return Some(offset + le64(&bsb[0x70..0x78]));
     }
     if magic(sb, 3, b"NTFS    ") {
         // NTFS BPB：bytes/sector @0x0B, sectors/cluster @0x0D, total sectors @0x28
@@ -416,9 +429,7 @@ pub struct GrowPlan {
 
 fn unsupported_reason(fs: FsKind) -> String {
     match fs {
-        FsKind::Btrfs => "btrfs not supported in v1".into(),
         FsKind::Luks => "LUKS encryption not supported".into(),
-        FsKind::Lvm => "LVM not supported in v1".into(),
         FsKind::Fat | FsKind::Exfat => "FAT/exFAT cannot be resized in place".into(),
         FsKind::Iso9660 => "ISO9660 filesystem".into(),
         FsKind::Swap => "swap is the only partition".into(),
@@ -463,7 +474,10 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &G
     if table.label == Label::None {
         let fs = sniff_fs(&mut f, 0);
         return match fs {
-            FsKind::Ext | FsKind::Xfs | FsKind::Ntfs => {
+            FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm => {
+                if fs == FsKind::Btrfs && btrfs_multi_device(&mut f, 0) {
+                    return skip("btrfs multi-device filesystem");
+                }
                 if let Some(fs_end) = fs_end_bytes(&mut f, 0)
                     && fs_end + MIN_FREE_SECTORS * SECTOR >= device_sectors * SECTOR
                 {
@@ -504,6 +518,9 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &G
     // 候选选择（最高级不变量"绝不移动有持久数据的分区"的直接推论）：
     // 可扩集合 = {末分区} ∪ {末分区=swap 时的倒数第二分区}
     let last_fs = sniff_fs(&mut f, last.first_lba * SECTOR);
+    if last_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, last.first_lba * SECTOR) {
+        return skip("btrfs multi-device filesystem");
+    }
     let (candidate, surgery) = if last_fs == FsKind::Swap {
         let Some(prev) = (sorted.len() >= 2).then(|| sorted[sorted.len() - 2].clone()) else {
             return skip("swap is the only partition");
@@ -512,7 +529,10 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &G
             return skip("MBR logical/extended not supported in v1");
         }
         let prev_fs = sniff_fs(&mut f, prev.first_lba * SECTOR);
-        if !matches!(prev_fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs) {
+        if prev_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, prev.first_lba * SECTOR) {
+            return skip("btrfs multi-device filesystem");
+        }
+        if !matches!(prev_fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm) {
             return skip("swap last, no growable partition before it");
         }
         let Some(si) = read_swap_info(&mut f, last.first_lba * SECTOR) else {
@@ -533,7 +553,7 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &G
         (prev, Some(plan))
     } else if last.is_container {
         return skip("MBR logical/extended not supported in v1");
-    } else if matches!(last_fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs) {
+    } else if matches!(last_fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm) {
         (last.clone(), None)
     } else {
         return skip(&unsupported_reason(last_fs));
@@ -598,17 +618,20 @@ const E2FSCK: &str = "/media/cdrom/grow/e2fsck";
 const RESIZE2FS: &str = "/media/cdrom/grow/resize2fs";
 const XFS_GROWFS: &str = "/media/cdrom/grow/xfs_growfs";
 const NTFSRESIZE: &str = "/media/cdrom/grow/ntfsresize";
+const BTRFS: &str = "/media/cdrom/grow/btrfs";
+/// LVM2 多调用二进制：统一以 `lvm <子命令>` 形式调用（pvresize/lvs/vgchange/lvextend）
+const LVM: &str = "/media/cdrom/grow/lvm";
 
 /// 原子写（write-to-tmp + rename，同 /run tmpfs 内 rename 原子），
 /// 杜绝 TUI 读到 truncate 后的空帧/半帧
 fn atomic_write(path: &str, content: &str) {
     let tmp = format!("{path}.tmp");
-    if let Ok(mut f) = File::create(&tmp) {
-        if f.write_all(content.as_bytes()).is_ok() {
-            let _ = f.sync_all();
-            let _ = fs::rename(&tmp, path);
-            return;
-        }
+    if let Ok(mut f) = File::create(&tmp)
+        && f.write_all(content.as_bytes()).is_ok()
+    {
+        let _ = f.sync_all();
+        let _ = fs::rename(&tmp, path);
+        return;
     }
     let _ = fs::write(path, content); // /run 不可写时的最后尝试（结果由 TUI crash 判定兜底）
 }
@@ -679,10 +702,10 @@ impl GrowCtx {
                 return None;
             }
         };
-        if let Some(data) = stdin_data {
-            if let Some(mut si) = child.stdin.take() {
-                let _ = si.write_all(data.as_bytes());
-            }
+        if let Some(data) = stdin_data
+            && let Some(mut si) = child.stdin.take()
+        {
+            let _ = si.write_all(data.as_bytes());
         }
         let out = child.wait_with_output().ok()?;
         let code = out.status.code().unwrap_or(-1);
@@ -696,6 +719,22 @@ impl GrowCtx {
             self.log(&format!("{tool} stderr: {se}"));
         }
         Some(code)
+    }
+
+    /// 工具执行并返回 stdout（LVM 的 VG/LV 元数据发现）。None = spawn 失败
+    fn run_capture(&self, tool: &str, args: &[&str]) -> Option<(i32, String)> {
+        let out = Command::new(tool).args(args).output().ok()?;
+        let code = out.status.code().unwrap_or(-1);
+        self.log(&format!("{tool} exit={code} (t={}s)", self.elapsed()));
+        let so = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !so.is_empty() {
+            self.log(&format!("{tool} stdout: {so}"));
+        }
+        if !se.is_empty() {
+            self.log(&format!("{tool} stderr: {se}"));
+        }
+        Some((code, so))
     }
 }
 
@@ -744,11 +783,15 @@ fn read_gpt_header(disk: &str) -> Option<(u64, (u32, u32))> {
 }
 
 /// backup header 是否已在设备末端标准位（relocate 成功/无需迁移的判据）
+/// 签名 + my_lba 双重校验（GPT 规范：my_lba @header+24 指向 header 自身）：
+/// 排除设备尾部残留旧 GPT 签名（my_lba 指向别处）造成的误判
 fn backup_header_at_end(disk: &str, device_sectors: u64) -> bool {
     let Ok(mut f) = File::open(disk) else { return false };
     let mut tail = [0u8; 512];
     let off = device_sectors.saturating_sub(1) * SECTOR;
-    read_at(&mut f, off, &mut tail) == 512 && &tail[0..8] == b"EFI PART"
+    read_at(&mut f, off, &mut tail) == 512
+        && &tail[0..8] == b"EFI PART"
+        && le64(&tail[24..32]) == device_sectors.saturating_sub(1)
 }
 
 /// 工具存在性守卫（模板 initramfs 与 grow.conf 不匹配时的安全网）。
@@ -766,6 +809,8 @@ fn tools_missing(fs: FsKind, need_surgery: bool) -> Option<String> {
         FsKind::Ext => &[E2FSCK, RESIZE2FS],
         FsKind::Xfs => &[XFS_GROWFS],
         FsKind::Ntfs => &[NTFSRESIZE],
+        FsKind::Btrfs => &[BTRFS],
+        FsKind::Lvm => &[LVM],
         _ => &[],
     };
     for t in fs_tools {
@@ -783,8 +828,8 @@ fn resize_fs(ctx: &GrowCtx, fs: FsKind, target: &str) -> Result<(), String> {
             let Some(code) = ctx.run(E2FSCK, &["-fp", target], None) else {
                 return Err("e2fsck spawn failed".into());
             };
-            // 显式白名单 matches!(code, 0|1|2)，禁止 code<4——防未来退出码扩展自动放行
-            if !matches!(code, 0 | 1 | 2) {
+            // 显式白名单 0..=2，禁止 4+——防未来退出码扩展自动放行
+            if !matches!(code, 0..=2) {
                 return Err(format!("e2fsck rejected (exit {code}, filesystem inconsistent)"));
             }
             match ctx.run(RESIZE2FS, &[target], None) {
@@ -834,8 +879,116 @@ fn resize_fs(ctx: &GrowCtx, fs: FsKind, target: &str) -> Result<(), String> {
                 None => Err("ntfsresize spawn failed".into()),
             }
         }
+        FsKind::Btrfs => {
+            // 在线扩容：btrfs filesystem resize max <挂载点>（官方 man 核实；
+            // 单设备由分析层 num_devices==1 保证，多设备已提前 skip）
+            let _ = Command::new("modprobe").arg("btrfs").status();
+            let _ = fs::create_dir_all(GROW_MNT);
+            #[cfg(target_os = "linux")]
+            {
+                use nix::mount::{MsFlags, mount, umount};
+                // 显式 turbofish：data=None 单独无法推断类型（与 init.rs 同模式）
+                if mount::<str, str, str, str>(Some(target), GROW_MNT, Some("btrfs"), MsFlags::empty(), None).is_err() {
+                    return Err("Btrfs kernel support unavailable".into());
+                }
+                let grown = matches!(ctx.run(BTRFS, &["filesystem", "resize", "max", GROW_MNT], None), Some(0));
+                let _ = umount(GROW_MNT);
+                if grown {
+                    return Ok(());
+                }
+                return Err("btrfs filesystem resize failed".into());
+            }
+            #[cfg(not(target_os = "linux"))]
+            Err("Btrfs grow requires Linux".into())
+        }
+        FsKind::Lvm => resize_lvm(ctx, target),
         _ => Err("unsupported filesystem".into()),
     }
+}
+
+/// LVM 扩容链：pvresize（PV 吃下分区新增空间）→ VG/LV 发现（唯一 LV 策略，
+/// 避免启发式猜错目标）→ vgchange -ay（initramfs 无 udev 规则，dm 节点必须
+/// 显式激活才会出现）→ lvextend -l +100%FREE → 对 dm 设备 sniff 后递归 fs 扩容。
+/// 递归深度有界：LV 上只可能是 ext/xfs/btrfs（再嵌套 LVM 的病态布局不支持）
+fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
+    let _ = Command::new("modprobe").arg("dm-mod").status();
+    // 静态 lvm 的运行时目录（锁文件/扫描缓存；无 udev 环境不自建则命令失败）
+    let _ = fs::create_dir_all("/run/lvm");
+    let _ = fs::create_dir_all("/run/lock/lvm");
+
+    // 1) PV 扩容（分区已由调用方扩完）
+    match ctx.run(LVM, &["pvresize", target], None) {
+        Some(0) => {}
+        Some(c) => return Err(format!("pvresize failed (exit {c})")),
+        None => return Err("lvm spawn failed".into()),
+    }
+
+    // 2) PV 所属 VG
+    let Some((code, vg_out)) = ctx.run_capture(LVM, &["pvs", "--noheadings", "-o", "vg_name", target]) else {
+        return Err("lvm spawn failed".into());
+    };
+    if code != 0 {
+        return Err(format!("pvs failed (exit {code})"));
+    }
+    let vg = vg_out.trim().to_string();
+    if vg.is_empty() {
+        return Err("PV not in any volume group".into());
+    }
+
+    // 3) VG 内 LV 清单：仅唯一 LV 自动扩（多 LV 目标选择是用户决策，不猜）
+    let Some((code, lvs_out)) = ctx.run_capture(LVM, &["lvs", "--noheadings", "-o", "lv_name", &vg]) else {
+        return Err("lvm spawn failed".into());
+    };
+    if code != 0 {
+        return Err(format!("lvs failed (exit {code})"));
+    }
+    let lv_names: Vec<String> =
+        lvs_out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+    if lv_names.len() != 1 {
+        return Err(format!("volume group {vg} has {} logical volumes (auto-grow requires exactly 1)", lv_names.len()));
+    }
+    let lv = &lv_names[0];
+    let lv_path = format!("/dev/{vg}/{lv}");
+
+    // 4) 激活 VG：dm 设备节点由激活创建（无 udev 的 initramfs 必需步骤）
+    match ctx.run(LVM, &["vgchange", "-ay", &vg], None) {
+        Some(0) => {}
+        Some(c) => return Err(format!("vgchange -ay failed (exit {c})")),
+        None => return Err("lvm spawn failed".into()),
+    }
+
+    // 5) LV 吃掉 VG 全部空闲 extent
+    match ctx.run(LVM, &["lvextend", "-l", "+100%FREE", &lv_path], None) {
+        Some(0) => {}
+        Some(c) => return Err(format!("lvextend failed (exit {c})")),
+        None => return Err("lvm spawn failed".into()),
+    }
+
+    // 6) 解析 dm 设备节点（/dev/<vg>/<lv> 是 udev 符号链接，此处不存在；
+    //    dm_path 给出真实节点 /dev/mapper/<vg>-<lv>，含转义规则处理）
+    let Some((code, dm_out)) = ctx.run_capture(LVM, &["lvs", "--noheadings", "-o", "dm_path", &lv_path]) else {
+        return Err("lvm spawn failed".into());
+    };
+    if code != 0 {
+        return Err(format!("lvs dm_path failed (exit {code})"));
+    }
+    let dm = dm_out.trim().to_string();
+    if dm.is_empty() {
+        return Err("cannot resolve LV device path".into());
+    }
+
+    // 7) LV 内容 fs 识别 → 递归扩容（工具守卫在此层补检）
+    let Ok(mut dev) = File::open(&dm) else {
+        return Err(format!("cannot open LV device {dm}"));
+    };
+    let lv_fs = sniff_fs(&mut dev, 0);
+    if !matches!(lv_fs, FsKind::Ext | FsKind::Xfs | FsKind::Btrfs) {
+        return Err(format!("LV filesystem not growable ({lv_fs:?})"));
+    }
+    if let Some(reason) = tools_missing(lv_fs, false) {
+        return Err(format!("{reason} (LV {dm})"));
+    }
+    resize_fs(ctx, lv_fs, &dm)
 }
 
 /// --grow 子进程入口：每步失败即写 result 退出，永不 panic，exit 0 恒成立
@@ -891,7 +1044,12 @@ pub fn run_grow(disk: &str) -> ! {
                         if backup_header_at_end(&ctx.disk, device_sectors) {
                             // 已在标准位（本就无需迁移）→ 继续
                         } else if read_gpt_header(&ctx.disk).is_some() {
-                            ctx.finish(Status::Skipped, "gpt backup header relocate failed", "", 0, 0);
+                            // backup 可能被半迁移（relocate 中途失败）→ 附幂等修复命令
+                            let reason = format!(
+                                "gpt backup header relocate failed (repair: sfdisk --relocate gpt-bak-std {})",
+                                ctx.disk
+                            );
+                            ctx.finish(Status::Skipped, &reason, "", 0, 0);
                         } else {
                             ctx.finish(Status::Failed, "gpt relocate failed (state unknown)", "", 0, 0);
                         }
@@ -925,7 +1083,10 @@ pub fn run_grow(disk: &str) -> ! {
                 if old_sectors >= min_size {
                     // 期望值未超过旧尺寸（对齐后无增长空间）→ 已是目标态
                 } else if !wait_partition_visible(&ctx, part_num, min_size) {
-                    ctx.finish(Status::Failed, "kernel partition reread failed", "", 0, 0);
+                    // 与手术路径同档归档：分区表已持久扩容（sfdisk exit 0 已过），
+                    // 卡点在内核同步 → Failed + fs 手动命令（重启后内核重读即扩，补 fs 即完成）
+                    let manual = manual_cmd_for_fs(fs, &part_dev);
+                    ctx.finish(Status::Failed, "kernel partition reread failed", &manual, old_sectors * SECTOR, 0);
                 }
 
                 write_phase("filesystem");
@@ -948,6 +1109,11 @@ fn manual_cmd_for_fs(fs: FsKind, dev: &str) -> String {
         FsKind::Ext => format!("e2fsck -fp {dev} && resize2fs {dev}"),
         FsKind::Xfs => format!("mount -t xfs {dev} /mnt && xfs_growfs -d /mnt && umount /mnt"),
         FsKind::Ntfs => format!("ntfsresize {dev}"),
+        FsKind::Btrfs => format!("mount -t btrfs {dev} /mnt && btrfs filesystem resize max /mnt && umount /mnt"),
+        // VG/LV 名运行期才可知，占位符形式给全链路命令（顺序与 resize_lvm 实际执行链一致）
+        FsKind::Lvm => format!(
+            "pvresize {dev}; pvs; vgchange -ay <vg>; lvextend -l +100%FREE <vg>/<lv>; resize2fs /dev/mapper/<vg>-<lv> (xfs: mount+xfs_growfs -d, btrfs: mount+btrfs filesystem resize max)"
+        ),
         _ => String::new(),
     }
 }
@@ -1160,5 +1326,5 @@ pub fn read_status_line() -> Option<String> {
 
 /// status 文件 mtime（hang 判定：停滞超时且子进程仍在运行）
 pub fn status_mtime() -> Option<SystemTime> {
-    fs::metadata(STATUS_FILE).ok().map(|m| m.modified().ok()).flatten()
+    fs::metadata(STATUS_FILE).ok().and_then(|m| m.modified().ok())
 }

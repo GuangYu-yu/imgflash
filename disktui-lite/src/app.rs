@@ -345,10 +345,10 @@ impl App {
             let p = self.progress.as_mut().unwrap();
             p.spinner_index = (p.spinner_index + 1) % 10;
         }
-        if self.screen == Screen::Growing {
-            if let Some(g) = self.grow.as_mut() {
-                g.spinner_index = (g.spinner_index + 1) % 10;
-            }
+        if self.screen == Screen::Growing
+            && let Some(g) = self.grow.as_mut()
+        {
+            g.spinner_index = (g.spinner_index + 1) % 10;
         }
 
         // Reboot countdown (10 ticks = 1 second at 100ms poll)

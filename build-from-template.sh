@@ -261,9 +261,14 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
         [[ -f "${GROW_BIN_DIR}/ntfsresize" ]] || die "GROW_TOOLS=ntfs 但 ntfsresize 缺失"
         cp "${GROW_BIN_DIR}/ntfsresize" "${GROW_STAGE}/"
     fi
-
-    [[ -f "${GROW_BIN_DIR}/LICENSES.txt" ]] || die "grow LICENSES.txt 缺失（应随 grow-tools workflow 生成）"
-    cp "${GROW_BIN_DIR}/LICENSES.txt" "${GROW_STAGE}/"
+    if grow_tool_enabled btrfs; then
+        [[ -f "${GROW_BIN_DIR}/btrfs" ]] || die "GROW_TOOLS=btrfs 但 btrfs 缺失"
+        cp "${GROW_BIN_DIR}/btrfs" "${GROW_STAGE}/"
+    fi
+    if grow_tool_enabled lvm; then
+        [[ -f "${GROW_BIN_DIR}/lvm" ]] || die "GROW_TOOLS=lvm 但 lvm 缺失"
+        cp "${GROW_BIN_DIR}/lvm" "${GROW_STAGE}/"
+    fi
 
     GROW_MAP_ARGS=(-map "${GROW_STAGE}" /grow)
 

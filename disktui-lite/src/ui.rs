@@ -472,7 +472,7 @@ fn wrap_words(s: &str, width: usize) -> Vec<String> {
     for word in s.split_whitespace() {
         if cur.is_empty() {
             cur = word.to_string();
-        } else if cur.chars().count() + word.chars().count() + 1 <= width {
+        } else if cur.chars().count() + word.chars().count() < width {
             cur.push(' ');
             cur.push_str(word);
         } else {

@@ -40,6 +40,22 @@ esac
 SIGNED_PKGS="${KERNEL_PKG},${GRUB_PKG}"
 [[ "${ENABLE_SECURE_BOOT:-0}" == "1" ]] && SIGNED_PKGS="${KERNEL_PKG},${SHIM_PKG},${GRUB_PKG}"
 
+# --- grow：fs 内核模块按 GROW_TOOLS 条目注入（必须在 REQUIRED_MODULES 计算前）---
+# xfs/btrfs 在线扩容需 mount（内核驱动）；lvm 需 device-mapper
+# crc32c_generic 前置于 xfs/btrfs：libcrc32c 有 softdep(pre: crc32c)，busybox modprobe
+# 不解析 modules.softdep，不显式先载则 libcrc32c init 时找不到 "crc32c" 算法而失败
+if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic xfs"
+    fi
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic btrfs"
+    fi
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} dm-mod"
+    fi
+fi
+
 BASE_MODULES="${MOD_FILESYSTEM} ${MOD_NLS} ${MOD_ATA} ${MOD_USB} ${MOD_CDROM} ${MOD_INPUT} ${MOD_EMMC} ${MOD_EMMC_CARDREADER} ${MOD_EMMC_USB:-}"
 OPT_NVME=$([[ "${INCLUDE_NVME}" != "0" ]] && echo "${MOD_NVME}" || echo "")
 OPT_VIRT=$([[ "${INCLUDE_VIRT}" != "0" ]] && echo "${MOD_VIRT}" || echo "")
@@ -275,11 +291,7 @@ if [[ "${USE_TUI}" == "1" ]]; then
     chmod +x "${INITRAMFS_DIR}/usr/bin/disktui-lite"
     ln -s /usr/bin/disktui-lite "${INITRAMFS_DIR}/init"
 
-    # --- grow：用户态工具注入 ISO 根 /grow/（Phase 4），initramfs 仅条件附带 xfs.ko ---
-    # 精确条目匹配（不用 *ext4* 子串——会误配 ext4foo 之类）
-    if [[ "${GROW_ENABLED:-0}" == "1" ]] && tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs; then
-        MOD_FILESYSTEM="${MOD_FILESYSTEM} xfs"   # XFS 是 v1 唯一需内核驱动的 fs（mount 所需）
-    fi
+    # --- grow 模块注入已前移至 REQUIRED_MODULES 计算处（脚本开头）---
 # else
 #     cp /bin/busybox "${INITRAMFS_DIR}/bin/busybox"
 #     chmod +x "${INITRAMFS_DIR}/bin/busybox"
@@ -410,9 +422,14 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
         [[ -f "${GROW_BIN_DIR}/ntfsresize" ]] || die "GROW_TOOLS=ntfs 但 ntfsresize 缺失"
         cp "${GROW_BIN_DIR}/ntfsresize" "${GROW_STAGE}/"
     fi
-
-    [[ -f "${GROW_BIN_DIR}/LICENSES.txt" ]] || die "grow LICENSES.txt 缺失（应随 grow-tools workflow 生成，GPL 随附义务见方案 B 节）"
-    cp "${GROW_BIN_DIR}/LICENSES.txt" "${GROW_STAGE}/"
+    if grow_tool_enabled btrfs; then
+        [[ -f "${GROW_BIN_DIR}/btrfs" ]] || die "GROW_TOOLS=btrfs 但 btrfs 缺失"
+        cp "${GROW_BIN_DIR}/btrfs" "${GROW_STAGE}/"
+    fi
+    if grow_tool_enabled lvm; then
+        [[ -f "${GROW_BIN_DIR}/lvm" ]] || die "GROW_TOOLS=lvm 但 lvm 缺失"
+        cp "${GROW_BIN_DIR}/lvm" "${GROW_STAGE}/"
+    fi
 
     # 粗粒度 fail-fast：覆盖值必须真实存在（sfdisk 对镜像文件可用）
     if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then

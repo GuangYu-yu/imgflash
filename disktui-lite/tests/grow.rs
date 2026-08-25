@@ -13,14 +13,14 @@ const S: u64 = 512;
 
 // ── 镜像构造工具 ────────────────────────────────────────────────────────
 
-fn mbr_entry(img: &mut Vec<u8>, slot: usize, ptype: u8, start: u64, sectors: u64) {
+fn mbr_entry(img: &mut [u8], slot: usize, ptype: u8, start: u64, sectors: u64) {
     let off = 446 + slot * 16;
     img[off + 4] = ptype;
     img[off + 8..off + 12].copy_from_slice(&(start as u32).to_le_bytes());
     img[off + 12..off + 16].copy_from_slice(&(sectors as u32).to_le_bytes());
 }
 
-fn sign_mbr(img: &mut Vec<u8>) {
+fn sign_mbr(img: &mut [u8]) {
     img[510] = 0x55;
     img[511] = 0xAA;
 }
@@ -56,7 +56,7 @@ fn gpt_disk(entries: &[([u8; 16], u64, u64)], total_sectors: u64, last_usable: u
     img
 }
 
-fn put_ext4(img: &mut Vec<u8>, off: u64, blocks: u64) {
+fn put_ext4(img: &mut [u8], off: u64, blocks: u64) {
     let b = off as usize;
     img[b + 0x438] = 0x53;
     img[b + 0x439] = 0xEF; // 魔数（sniff 与 superblock 校验同址）
@@ -65,27 +65,35 @@ fn put_ext4(img: &mut Vec<u8>, off: u64, blocks: u64) {
     img[sb + 0x18..sb + 0x1C].copy_from_slice(&0u32.to_le_bytes()); // log_bs=0 → 1K 块
 }
 
-fn put_xfs(img: &mut Vec<u8>, off: u64) {
+fn put_xfs(img: &mut [u8], off: u64) {
     let b = off as usize;
     img[b..b + 4].copy_from_slice(b"XFSB");
 }
 
-fn put_ntfs(img: &mut Vec<u8>, off: u64) {
+fn put_ntfs(img: &mut [u8], off: u64) {
     let b = off as usize;
     img[b + 3..b + 11].copy_from_slice(b"NTFS    ");
 }
 
-fn put_fat(img: &mut Vec<u8>, off: u64) {
+fn put_fat(img: &mut [u8], off: u64) {
     let b = off as usize;
     img[b + 0x36..b + 0x39].copy_from_slice(b"FAT");
 }
 
-fn put_btrfs(img: &mut Vec<u8>, off: u64) {
+fn put_btrfs(img: &mut [u8], off: u64, num_devices: u64) {
     let b = off as usize;
     img[b + 0x10040..b + 0x10048].copy_from_slice(b"_BHRfS_M");
+    // num_devices @超级块+0x88（绝对 off+0x10088，官方 On-disk Format 核实）
+    img[b + 0x10088..b + 0x10090].copy_from_slice(&num_devices.to_le_bytes());
 }
 
-fn put_swap(img: &mut Vec<u8>, off: u64, uuid: &[u8; 16], label: &str) {
+/// LVM2 PV label（LABELONE @512）
+fn put_lvm(img: &mut [u8], off: u64) {
+    let b = off as usize;
+    img[b + 512..b + 520].copy_from_slice(b"LABELONE");
+}
+
+fn put_swap(img: &mut [u8], off: u64, uuid: &[u8; 16], label: &str) {
     let b = off as usize;
     img[b + 4086..b + 4096].copy_from_slice(b"SWAPSPACE2");
     img[b + 1036..b + 1052].copy_from_slice(uuid);
@@ -244,9 +252,14 @@ fn sniff_fs_detects_each_magic() {
     put_fat(&mut img, 0);
     assert_eq!(sniff_fs(&mut Cursor::new(img.clone()), 0), FsKind::Fat);
 
-    let mut img = vec![0u8; 0x10048];
-    put_btrfs(&mut img, 0);
+    // btrfs 超级块字段延伸到 0x10090（num_devices），镜像需覆盖
+    let mut img = vec![0u8; 0x10090];
+    put_btrfs(&mut img, 0, 1);
     assert_eq!(sniff_fs(&mut Cursor::new(img.clone()), 0), FsKind::Btrfs);
+
+    let mut img = vec![0u8; 0x10048];
+    put_lvm(&mut img, 0);
+    assert_eq!(sniff_fs(&mut Cursor::new(img.clone()), 0), FsKind::Lvm);
 
     let mut img = vec![0u8; 0x10048];
     put_swap(&mut img, 0, &[1; 16], "");
@@ -479,6 +492,98 @@ fn analyze_declared_part_matching_candidate_proceeds() {
     let policy = GrowPolicy { enabled: true, part: PartSpec::Number(1) };
     let plan = analyze_with(&path, "sda", 10000, &policy);
     assert!(plan.action.is_some(), "declared part matching candidate should grow");
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── Btrfs / LVM 分析决策 ────────────────────────────────────────────────
+
+/// btrfs 末分区需容纳超级块（分区偏移 + 0x10090 字节），磁盘要足够大
+#[test]
+fn analyze_mbr_grows_last_btrfs_single_device() {
+    // 4096 扇区分区放不下 0x10090(131216B ≈ 256 扇区) 超级块——用大分区
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    put_btrfs(&mut img, 2048 * S, 1);
+    let path = temp_img("img", &img);
+
+    let plan = analyze_with(&path, "sda", 20000, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { part_num, fs, surgery, .. }) = plan.action else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(part_num, 1);
+    assert_eq!(fs, FsKind::Btrfs);
+    assert!(surgery.is_none());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_skips_btrfs_multi_device() {
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    put_btrfs(&mut img, 2048 * S, 2); // num_devices=2 → 多设备
+    let path = temp_img("img", &img);
+
+    let plan = analyze_with(&path, "sda", 20000, &enabled_policy());
+    assert!(plan.action.is_none());
+    assert_eq!(plan.skip_reason.as_deref(), Some("btrfs multi-device filesystem"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_skips_btrfs_multi_device_superfloppy() {
+    let mut img = vec![0u8; 20000 * S as usize];
+    put_btrfs(&mut img, 0, 3);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, &enabled_policy());
+    assert!(plan.action.is_none());
+    assert_eq!(plan.skip_reason.as_deref(), Some("btrfs multi-device filesystem"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_mbr_grows_last_lvm_pv() {
+    // type 0x8e = Linux LVM；PV label @512 在分区内
+    let mut img = mbr_disk(&[(0x8e, 2048, 4096)], 10000);
+    put_lvm(&mut img, 2048 * S);
+    let path = temp_img("img", &img);
+
+    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { part_num, fs, surgery, .. }) = plan.action else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(part_num, 1);
+    assert_eq!(fs, FsKind::Lvm);
+    assert!(surgery.is_none());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_swap_last_with_lvm_prev_surgery() {
+    // p1: LVM PV；p2: swap → swap 手术，目标是 PV 分区
+    let mut img = mbr_disk(&[(0x8e, 2048, 4096), (0x82, 6144, 1024)], 10000);
+    put_lvm(&mut img, 2048 * S);
+    put_swap(&mut img, 6144 * S, &[0xAB; 16], "sw");
+    let path = temp_img("img", &img);
+
+    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { part_num, fs, surgery, .. }) = plan.action else {
+        panic!("expected surgery plan, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(part_num, 1);
+    assert_eq!(fs, FsKind::Lvm);
+    let s = surgery.expect("surgery plan");
+    assert_eq!(s.swap_num, 2);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_btrfs_superfloppy_filesystem_only() {
+    let mut img = vec![0u8; 20000 * S as usize];
+    put_btrfs(&mut img, 0, 1);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, &enabled_policy());
+    let Some(GrowAction::FilesystemOnly { fs, .. }) = plan.action else {
+        panic!("expected FilesystemOnly, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(fs, FsKind::Btrfs);
     let _ = std::fs::remove_file(&path);
 }
 
