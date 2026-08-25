@@ -196,10 +196,12 @@ jobs:
           # 组开关（强制带 cfdisk 硬依赖 ncurses）；mkswap 在 --disable-all-programs
           # 下被关闭且无覆盖。默认全量构建时三件套都自动启用，ncurses 系工具
           # （cfdisk/ul/more/pg/setterm/irqtop）在 --without 下按 check 软跳过；
+          # lastlog2 要 glibc 的 libsqlite3 静态链接必炸，直接关掉；
           # 库必须 make install 到 prefix，xfsprogs/ntfs-3g 靠它链接
           ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static \
+            --disable-liblastlog2 \
             --enable-libblkid --enable-libuuid --enable-libfdisk --enable-libsmartcols \
             --without-tinfo --without-ncurses --without-ncursesw --without-readline \
             --without-python --without-systemd --without-systemdsystemunitdir \
