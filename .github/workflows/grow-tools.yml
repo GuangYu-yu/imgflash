@@ -244,8 +244,9 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/xfsprogs-${V_XFS}"
-          # 自定义构建系统：CPPFLAGS 被丢弃（-I 进 CFLAGS），LDFLAGS 被清空
-          # （用 sed 补 -all-static 让 libtool 程序完全静态）；
+          # 自定义构建系统：CPPFLAGS 被丢弃（-I 进 CFLAGS）；builddefs.in 把
+          # configure 写入的 LDFLAGS 清空为 LDFLAGS =，用 make 命令行覆盖
+          # （GNU Make 命令行变量优先级最高）传入 -all-static；
           # ioctl_cxx_dummy.cpp 是 C++ 布局检查，走 CXXFLAGS（纯编译不链接）；
           # musl 的 statx 定义与内核头冲突，OVERRIDE_SYSTEM_STATX 是 Alpine 同款规避
           ./configure \
@@ -256,10 +257,8 @@ jobs:
             CFLAGS="${HOST_CFLAGS} -I$PREFIX/include -DOVERRIDE_SYSTEM_STATX -DSTATX__RESERVED=0x80000000U" \
             CXXFLAGS="-I$PREFIX/include -DOVERRIDE_SYSTEM_STATX -DSTATX__RESERVED=0x80000000U" \
             LDFLAGS="-static -L$PREFIX/lib"
-          # builddefs.in 把 LDFLAGS 清空为 LDFLAGS =，需补 -all-static
-          sed -i 's/^LDFLAGS =$/LDFLAGS = -all-static -L$PREFIX\/lib/' include/builddefs
           make -j"$(nproc)" headers
-          make -j"$(nproc)" growfs
+          make -j"$(nproc)" growfs LDFLAGS="-all-static -L$PREFIX/lib"
           cp growfs/xfs_growfs "$OUT/"
 
       - name: 编译 ntfs-3g
