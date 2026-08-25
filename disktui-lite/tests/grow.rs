@@ -42,7 +42,7 @@ fn gpt_disk(entries: &[([u8; 16], u64, u64)], total_sectors: u64, last_usable: u
 
     let h = S as usize;
     img[h..h + 8].copy_from_slice(b"EFI PART");
-    img[h + 64..h + 72].copy_from_slice(&last_usable.to_le_bytes());
+    img[h + 48..h + 56].copy_from_slice(&last_usable.to_le_bytes());
     img[h + 72..h + 80].copy_from_slice(&2u64.to_le_bytes()); // entries start LBA
     img[h + 80..h + 84].copy_from_slice(&128u32.to_le_bytes()); // num entries
     img[h + 84..h + 88].copy_from_slice(&128u32.to_le_bytes()); // entry size
@@ -286,7 +286,7 @@ fn read_swap_info_extracts_uuid_and_label() {
     ];
     put_swap(&mut img, 0, &uuid, "myswap");
     let si = read_swap_info(&mut Cursor::new(img), 0).unwrap();
-    assert_eq!(si.uuid, "112233445566778899aabbccddeeff00");
+    assert_eq!(si.uuid, "11223344-5566-7788-99aa-bbccddeeff00");
     assert_eq!(si.label, "myswap");
 }
 
@@ -351,7 +351,7 @@ fn analyze_mbr_swap_surgery_plan() {
     assert_eq!(s.swap_first_lba, 6144);
     assert_eq!(s.swap_sectors, 1024);
     assert_eq!(s.swap_ptype, "82");
-    assert_eq!(s.swap_uuid, "ab".repeat(16));
+    assert_eq!(s.swap_uuid, "abababab-abab-abab-abab-abababababab");
     assert_eq!(s.swap_label, "sw");
     assert!(s.swap_partuuid.is_none()); // MBR 无 PARTUUID
     let _ = std::fs::remove_file(&path);

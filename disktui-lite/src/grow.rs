@@ -218,7 +218,7 @@ pub fn parse_table(dev: &mut dyn ReadSeek) -> Option<PartTable> {
             let entry_lba = le64(&lba1[72..80]);
             let num_entries = le32(&lba1[80..84]);
             let entry_size = le32(&lba1[84..88]).max(128);
-            let last_usable = le64(&lba1[64..72]);
+            let last_usable = le64(&lba1[48..56]);
             let mut gpt_entries = Vec::new();
             let mut buf = vec![0u8; entry_size as usize];
             for i in 0..num_entries {
@@ -289,7 +289,8 @@ pub fn sniff_fs(dev: &mut dyn ReadSeek, part_offset: u64) -> FsKind {
     if magic(buf, 0, b"LUKS\xBA\xBE") {
         return FsKind::Luks;
     }
-    if magic(buf, 512, b"LABELONE") {
+    // LVM 标签可位于前 4 扇区任意位置（lvm 自身即按此扫描；mkfs 默认写 512）
+    if (0..4).any(|s| magic(buf, s * 512, b"LABELONE")) {
         return FsKind::Lvm;
     }
     if magic(buf, 3, b"EXFAT") {
@@ -298,7 +299,11 @@ pub fn sniff_fs(dev: &mut dyn ReadSeek, part_offset: u64) -> FsKind {
     if magic(buf, 0x36, b"FAT") || magic(buf, 0x52, b"FAT") {
         return FsKind::Fat;
     }
-    if magic(buf, 4086, b"SWAPSPACE2") || magic(buf, 8186, b"SWAPSPACE2") {
+    // 魔数在页尾：4096/8192/65536 页大小（aarch64 64K pages 内核在 65526）
+    if magic(buf, 4086, b"SWAPSPACE2")
+        || magic(buf, 8186, b"SWAPSPACE2")
+        || magic(buf, 65526, b"SWAPSPACE2")
+    {
         return FsKind::Swap;
     }
     if magic(buf, 0x8001, b"CD001") {
@@ -315,19 +320,32 @@ fn btrfs_multi_device(dev: &mut dyn ReadSeek, part_offset: u64) -> bool {
     read_at(dev, part_offset + 0x10000, &mut sb) == 0x90 && le64(&sb[0x88..0x90]) > 1
 }
 
-/// swap 头（v1）：UUID @1036、label @1052，魔数在页尾（4086/8186 按页大小）
+/// swap 头（v1）：UUID @1036、label @1052，魔数在页尾（4086/8186/65526 按页大小）
 pub struct SwapInfo {
     pub uuid: String,
     pub label: String,
 }
 
 pub fn read_swap_info(dev: &mut dyn ReadSeek, part_offset: u64) -> Option<SwapInfo> {
-    let mut page = [0u8; 8192];
+    let mut page = [0u8; 65536];
     let n = read_at(dev, part_offset, &mut page);
-    if !(magic(&page[..n], 4086, b"SWAPSPACE2") || magic(&page[..n], 8186, b"SWAPSPACE2")) {
+    let page = &page[..n];
+    if !(magic(page, 4086, b"SWAPSPACE2")
+        || magic(page, 8186, b"SWAPSPACE2")
+        || magic(page, 65526, b"SWAPSPACE2"))
+    {
         return None;
     }
-    let uuid = page[1036..1052].iter().map(|b| format!("{b:02x}")).collect::<String>();
+    // mkswap -U / libuuid uuid_parse 只接受 8-4-4-4-12 带连字符格式，swap 头字节序即 uuid_unparse 顺序
+    let uuid = page[1036..1052]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .concat();
+    let uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &uuid[0..8], &uuid[8..12], &uuid[12..16], &uuid[16..20], &uuid[20..32]
+    );
     let label_end = page[1052..1068].iter().position(|&b| b == 0).unwrap_or(16);
     let label = String::from_utf8_lossy(&page[1052..1052 + label_end]).trim().to_string();
     Some(SwapInfo { uuid, label })
@@ -799,7 +817,7 @@ fn read_gpt_header(disk: &str) -> Option<(u64, (u32, u32))> {
     if read_at(&mut f, SECTOR, &mut lba1) < 512 || &lba1[0..8] != b"EFI PART" {
         return None;
     }
-    Some((le64(&lba1[64..72]), (le32(&lba1[80..84]), le32(&lba1[84..88]))))
+    Some((le64(&lba1[48..56]), (le32(&lba1[80..84]), le32(&lba1[84..88]))))
 }
 
 /// backup header 是否已在设备末端标准位（relocate 成功/无需迁移的判据）
