@@ -192,15 +192,14 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/util-linux-${V_UTIL}"
-          # 官方按需构建方式：--disable-all-programs 后用 --enable-<name>
-          # 单程序开关（howto-compilation.txt），不能用 --enable-fdisks——
-          # 那个组强制带上 cfdisk，会引入 ncurses 依赖；
+          # 2.41.5 没有 sfdisk/mkswap 单程序开关：sfdisk 只能靠 --enable-fdisks
+          # 组开关（强制带 cfdisk 硬依赖 ncurses）；mkswap 在 --disable-all-programs
+          # 下被关闭且无覆盖。默认全量构建时三件套都自动启用，ncurses 系工具
+          # （cfdisk/ul/more/pg/setterm/irqtop）在 --without 下按 check 软跳过；
           # 库必须 make install 到 prefix，xfsprogs/ntfs-3g 靠它链接
           ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static \
-            --disable-all-programs \
-            --enable-sfdisk --enable-mkswap --enable-partx \
             --enable-libblkid --enable-libuuid --enable-libfdisk --enable-libsmartcols \
             --without-tinfo --without-ncurses --without-ncursesw --without-readline \
             --without-python --without-systemd --without-systemdsystemunitdir \
