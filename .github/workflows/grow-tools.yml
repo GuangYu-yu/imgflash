@@ -354,16 +354,23 @@ jobs:
           set -euo pipefail
           cd "$SRC/LVM2.${V_LVM}"
           MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-          # musl-gcc 会通过 specs 覆盖默认 include 路径；
-          # LVM2/libdm 的 libdevmapper.h 需要 linux/types.h。
-          # Ubuntu 的 linux-libc-dev 提供 /usr/include/linux 和
-          # /usr/include/${MULTIARCH}/asm 等 userspace kernel headers。
-          export CPPFLAGS="-I/usr/include -I/usr/include/${MULTIARCH} -I/usr/include/asm-generic -I$PREFIX/include"
+          # musl-gcc 保持自己的 musl libc headers；
+          # Linux userspace kernel headers 单独放到 after 路径，
+          # 避免 /usr/include 中的 glibc headers 污染 musl。
+          export CPPFLAGS="\
+            -I$PREFIX/include \
+            -idirafter /usr/include \
+            -idirafter /usr/include/${MULTIARCH} \
+            -idirafter /usr/include/asm-generic"
           export CFLAGS="${HOST_CFLAGS} -I$PREFIX/include"
           export LDFLAGS="-static -L$PREFIX/lib"
-          # 先确认 musl-gcc 能看到 Linux kernel userspace headers。
-          test -f /usr/include/linux/types.h
-          printf '#include <linux/types.h>\n' | musl-gcc ${CPPFLAGS} -E - >/dev/null
+          # 确认 musl-gcc 同时能看到：
+          # 1. musl 自己的 signal.h
+          # 2. Ubuntu linux-libc-dev 提供的 linux/types.h
+          printf '#include <signal.h>\n' |
+            musl-gcc ${CPPFLAGS} -E - >/dev/null
+          printf '#include <linux/types.h>\n' |
+            musl-gcc ${CPPFLAGS} -E - >/dev/null
           ./configure \
             --prefix="$PREFIX" \
             --enable-static_link \
@@ -375,10 +382,10 @@ jobs:
             --with-blkid=none \
             --with-systemdsystemunitdir=/dev/null \
             CC=musl-gcc
-          # libdevmapper.a
+          # 构建 libdevmapper.a
           make -j"$(nproc)" device-mapper
           make install_device-mapper
-          # lvm
+          # 构建静态 lvm
           make -j"$(nproc)" lvm
           cp tools/lvm "$OUT/lvm"
 
