@@ -166,9 +166,9 @@ cd ..
 | `INCLUDE_VIRT` | 虚拟化模块开关 | `1` |
 | `ENABLE_SECURE_BOOT` | Secure Boot 支持 | `0` |
 | `USE_TUI` | 安装器模式（1=TUI / 0=Shell） | `1` |
-| `GROW_ENABLED` | dd 后自动扩容末分区（构建期能力开关，1=工具打入 initramfs） | `1` |
+| `GROW_ENABLED` | dd 后自动扩容末分区（构建期开关，1=工具随构建注入 ISO `/grow/`） | `1` |
 | `GROW_PART` | 指定扩容分区号（`auto`=自动取末分区；候选校验失败则跳过） | `auto` |
-| `GROW_TOOLS` | 打包哪些文件系统扩容工具（`ext4,xfs,ntfs` 子集；sfdisk/mkswap/partx 为核心依赖无条件打包） | `"ext4,xfs,ntfs"` |
+| `GROW_TOOLS` | 注入哪些文件系统扩容工具到 ISO `/grow/`（`ext4,xfs,ntfs` 子集；sfdisk/mkswap/partx 为核心依赖无条件注入） | `"ext4,xfs,ntfs"` |
 | `BOOT_TIMEOUT` | 启动菜单超时（秒） | `0` |
 | `KERNEL_PARAMS` | 内核启动参数 | `quiet` |
 | `SCAN_TIMEOUT` | 启动时扫描介质的超时秒数 | `10` |
@@ -223,9 +223,11 @@ cd ..
 dd 写入成功后，安装器自动将目标盘的**最后一个分区**原地扩展到盘尾，并扩展其文件系统（ext4 / XFS / NTFS），填满"盘 > 镜像"产生的尾部空闲空间。失败或跳过仅降级为警告，永不阻塞重启。
 
 - **候选规则**：只扩末分区；若末分区是 swap，则先做"swap 手术"（删除 → 扩倒数第二分区 → 磁盘末尾重建 swap，UUID/PARTUUID/分区号全保留）
-- **跳过场景**：尾部空闲 < 1MiB、FAT/exFAT、Btrfs/LVM/LUKS（v1）、MBR 扩展/逻辑分区、无分区表（superfloppy 直接扩 fs）
+- **跳过场景**：尾部空闲 < 1MiB、FAT/exFAT、Btrfs/LVM/LUKS（v1）、MBR 扩展/逻辑分区
+- **superfloppy**（无分区表镜像）：跳过分区步骤，直接扩文件系统
 - **逃生门**：内核参数 `grow=off` 可在运行期强制禁用
-- **模板兼容**：工具在模板构建时由 `GROW_ENABLED`/`GROW_TOOLS` 一次定型；每次构建的运行策略（开关、分区号）经 ISO 根的 `grow.conf` 映射，不重建 initramfs
+- **指定分区**：`GROW_PART=<N>`（或 workflow 输入 `grow_part`）为"候选确认"语义——声明的分区必须恰好是自动候选（末分区或 swap 挡尾时的倒数第二），否则 Skip；不存在多分区/按比例的分区重排语法
+- **架构**：工具 + `grow.conf` + `LICENSES.txt` 住 ISO `/grow/`，随每次构建注入（模板再生成也不携带工具）；initramfs 只含 grow 逻辑与条件 xfs.ko，故工具版本与模板解耦
 
 安装结果屏会显示一行扩容状态（Expanded / Skipped / Partial / Failed）；Partial 状态附自包含的手动恢复命令（重启后 `/run` 数据即失）。
 
