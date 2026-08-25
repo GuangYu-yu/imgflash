@@ -5,7 +5,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use disktui_lite::app::{App, AppResult, ExitAction};
-use disktui_lite::handler::{handle_key_events, poll_dd_progress};
+use disktui_lite::handler::{handle_key_events, poll_dd_progress, poll_grow_progress};
 #[cfg(target_os = "linux")]
 use disktui_lite::init;
 use disktui_lite::tui::Tui;
@@ -48,6 +48,14 @@ fn main() -> AppResult<()> {
                 .skip(1));
         let code = uu_dd::uumain(dd_args);
         std::process::exit(code);
+    }
+
+    // Self-fork: if invoked with --grow <disk>, run the post-dd auto-grow
+    // subprocess and exit. Exit code only signals process health; the
+    // outcome is carried by /run/grow.result (see grow.rs contract).
+    if let Some(pos) = std::env::args().position(|a| a == "--grow") {
+        let disk = std::env::args().nth(pos + 1).unwrap_or_default();
+        disktui_lite::grow::run_grow(&disk);
     }
 
     // Detect if we are PID 1 (running as init in initramfs)
@@ -99,6 +107,9 @@ fn main() -> AppResult<()> {
 
         // Poll dd progress
         poll_dd_progress(&mut app);
+
+        // Poll post-dd grow progress
+        poll_grow_progress(&mut app);
 
         // Handle input (100ms timeout = tick rate)
         if crossterm::event::poll(Duration::from_millis(100))?

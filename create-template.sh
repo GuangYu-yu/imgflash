@@ -196,6 +196,23 @@ cp "${SCRIPT_DIR}/binaries/disktui-lite" "${INITRAMFS_DIR}/usr/bin/disktui-lite"
 chmod +x "${INITRAMFS_DIR}/usr/bin/disktui-lite"
 ln -s /usr/bin/disktui-lite "${INITRAMFS_DIR}/init"
 
+# --- grow：工具随 fast path 注入 ISO 根 /grow/，模板仅条件附带 fs 内核模块 ---
+# 精确条目匹配（不用 *ext4* 子串——会误配 ext4foo 之类）
+# xfs/btrfs 在线扩容需 mount（内核驱动）；lvm 需 device-mapper
+# crc32c_generic 前置于 xfs/btrfs：libcrc32c 有 softdep(pre: crc32c)，busybox modprobe
+# 不解析 modules.softdep，不显式先载则 libcrc32c init 时找不到 "crc32c" 算法而失败
+if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic xfs"
+    fi
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic btrfs"
+    fi
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} dm-mod"
+    fi
+fi
+
 # 模块列表
 BASE_MODULES="${MOD_FILESYSTEM} ${MOD_NLS} ${MOD_ATA} ${MOD_USB} ${MOD_CDROM} ${MOD_INPUT} ${MOD_EMMC} ${MOD_EMMC_CARDREADER} ${MOD_EMMC_USB:-}"
 OPT_NVME=$([[ "${INCLUDE_NVME}" != "0" ]] && echo "${MOD_NVME}" || echo "")
@@ -271,6 +288,8 @@ echo ""; echo "[Phase 4] 组装模板 ISO ..."
 mkdir -p "${ISO_DIR}/boot"
 mv "${VMLINUZ}" "${ISO_DIR}/boot/vmlinuz"
 mv "${BUILD_DIR}/initrd.img" "${ISO_DIR}/boot/initrd.img"
+# grow 工具/conf/许可证均由 fast path（build-from-template.sh）注入 ISO 根 /grow/，
+# 模板不携带——能力随构建可变，消除模板与工具版本脱同步风险
 
 # --- BIOS 引导（syslinux，仅 amd64） ---
 if [[ "${HAS_BIOS}" -eq 1 ]]; then

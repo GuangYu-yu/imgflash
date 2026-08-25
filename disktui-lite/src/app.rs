@@ -1,7 +1,9 @@
 use std::fs;
 use std::process::Child;
+use std::time::{Instant, SystemTime};
 
 use crate::disk::DiskInfo;
+use crate::grow::{self, GrowOutcome};
 use crate::notification::Notification;
 use crate::theme::Theme;
 
@@ -18,6 +20,7 @@ pub enum Screen {
     Confirmation,
     Writing,
     WriteError,
+    Growing,
     Success,
 }
 
@@ -172,6 +175,72 @@ impl WriteProgress {
     }
 }
 
+// ── Grow progress tracking ──────────────────────────────────────────────
+//
+// Tracks the --grow subprocess spawned after a successful dd write.
+// Progress phases come from /run/grow.status (atomic writes); the final
+// outcome from /run/grow.result. The child is NEVER killed from the TUI:
+// a kill during sfdisk mutation would deliberately create the torn
+// partition-table window the design accepts only for power loss.
+
+#[derive(Debug)]
+pub struct GrowProgress {
+    pub(crate) disk_name: String,
+    pub(crate) phase_text: String,
+    pub(crate) spinner_index: usize,
+    grow_child: Option<Child>,
+    started: Instant,
+    last_change: Instant,
+    last_mtime: Option<SystemTime>,
+}
+
+impl GrowProgress {
+    pub fn new(disk_name: &str, child: Child) -> Self {
+        let now = Instant::now();
+        Self {
+            disk_name: disk_name.to_string(),
+            phase_text: "Analyzing disk layout".to_string(),
+            spinner_index: 0,
+            grow_child: Some(child),
+            started: now,
+            last_change: now,
+            last_mtime: None,
+        }
+    }
+
+    /// Poll /run/grow.status: refresh phase text and advance the change
+    /// timestamp when mtime moves (hang detection input).
+    pub fn poll_status(&mut self) {
+        if let Some(mtime) = grow::status_mtime()
+            && self.last_mtime != Some(mtime)
+        {
+            self.last_mtime = Some(mtime);
+            self.last_change = Instant::now();
+            if let Some(text) = grow::read_status_line() {
+                self.phase_text = text;
+            }
+        }
+    }
+
+    /// Elapsed time without a status file change.
+    pub fn stalled_for(&self) -> std::time::Duration {
+        self.last_change.elapsed()
+    }
+
+    /// Check whether the grow subprocess has exited (reaps on first true).
+    pub fn child_exited(&mut self) -> bool {
+        if let Some(ref mut child) = self.grow_child {
+            matches!(child.try_wait(), Ok(Some(_)))
+        } else {
+            true
+        }
+    }
+
+    pub fn elapsed_secs(&self) -> u64 {
+        self.started.elapsed().as_secs()
+    }
+}
+
 // ── Main App ────────────────────────────────────────────────────────────
 
 pub struct App {
@@ -181,6 +250,9 @@ pub struct App {
     pub(crate) disks_state: TableState,
     pub(crate) confirm_button: ConfirmButton,
     pub(crate) progress: Option<WriteProgress>,
+    pub(crate) grow: Option<GrowProgress>,
+    /// Final grow outcome rendered on the Success screen (None = no grow line)
+    pub(crate) grow_outcome: Option<GrowOutcome>,
     pub(crate) success_action: SuccessAction,
     pub(crate) reboot_counting: bool,
     pub(crate) reboot_countdown: u8,
@@ -210,6 +282,8 @@ impl App {
             disks_state,
             confirm_button: ConfirmButton::default(),
             progress: None,
+            grow: None,
+            grow_outcome: None,
             success_action: SuccessAction::default(),
             reboot_counting: false,
             reboot_countdown: Self::REBOOT_SECONDS,
@@ -266,10 +340,15 @@ impl App {
             n.ttl -= 1;
         }
 
-        // Rotate spinner when writing
+        // Rotate spinner when writing / growing
         if self.screen == Screen::Writing {
             let p = self.progress.as_mut().unwrap();
             p.spinner_index = (p.spinner_index + 1) % 10;
+        }
+        if self.screen == Screen::Growing
+            && let Some(g) = self.grow.as_mut()
+        {
+            g.spinner_index = (g.spinner_index + 1) % 10;
         }
 
         // Reboot countdown (10 ticks = 1 second at 100ms poll)
@@ -314,7 +393,14 @@ impl App {
 
     pub fn goto_writing(&mut self, progress: WriteProgress) {
         self.progress = Some(progress);
+        self.grow = None;
+        self.grow_outcome = None; // stale outcome must not leak into the next write cycle
         self.screen = Screen::Writing;
+    }
+
+    pub fn goto_growing(&mut self, grow: GrowProgress) {
+        self.grow = Some(grow);
+        self.screen = Screen::Growing;
     }
 
     pub fn goto_write_error(&mut self) {
@@ -326,6 +412,7 @@ impl App {
         self.reboot_counting = false;
         self.reboot_countdown = Self::REBOOT_SECONDS;
         self.reboot_last_tick = self.tick_count;
+        self.grow = None;
         self.screen = Screen::Success;
     }
 

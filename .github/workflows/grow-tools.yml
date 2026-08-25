@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       util_linux_version:
-        description: 'util-linux 版本（示例 2.41.5）'
+        description: 'util-linux 版本（示例 2.42.2；btrfs-progs 构建必须同时填写）'
         required: false
       e2fsprogs_version:
         description: 'e2fsprogs 版本（示例 1.47.4）'
@@ -15,6 +15,20 @@ on:
       ntfs3g_version:
         description: 'ntfs-3g 版本（示例 2026.7.7）'
         required: false
+      btrfs_progs_version:
+        description: 'btrfs-progs 版本（示例 7.1）'
+        required: false
+      lvm2_version:
+        description: 'LVM2 版本（示例 2.03.42）'
+        required: false
+
+env:
+  # xfsprogs 的两个硬依赖，随流水线统一升级，不作为输入
+  INIH_VERSION: "62"
+  URCU_VERSION: "0.15.6"
+  # btrfs-progs / LVM2 的硬依赖，同样固定
+  ZLIB_VERSION: "1.3.2"
+  LIBAIO_VERSION: "0.3.113"
 
 jobs:
   build:
@@ -28,11 +42,14 @@ jobs:
         include:
           - arch_dir: AMD64
             runner: ubuntu-latest
+            arch_flags: ""
           - arch_dir: ARM64
             runner: ubuntu-24.04-arm
+            # aarch64 musl 静态链接：libgcc 的 lse-init.o 引用 glibc 私有符号
+            # __getauxval，必须关 outline atomics 才不拉入
+            arch_flags: "-mno-outline-atomics"
 
     steps:
-      # 1. 准备工作区
       - name: 检出
         uses: actions/checkout@v4
         with:
@@ -43,98 +60,144 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y musl-tools linux-libc-dev dpkg-dev
-          # musl-gcc 不搜 Ubuntu 多架构 triplet 目录，linux-libc-dev 的 <linux/version.h>
-          # 就放在那里，不加 util-linux configure 会报 "kernel headers required on Linux"。
+          # musl-gcc 不搜 Ubuntu 多架构 triplet 目录，内核头在那里，
+          # 不加 -idirafter util-linux 会报 "kernel headers required"
           MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
           ROOT="$GITHUB_WORKSPACE"
           mkdir -p "$ROOT/src" "$ROOT/out" "$ROOT/prefix"
           {
-            echo "MULTIARCH=$MULTIARCH"
             echo "HOST_CPPFLAGS=-idirafter /usr/include -idirafter /usr/include/${MULTIARCH}"
-            echo "HOST_CFLAGS=-idirafter /usr/include -idirafter /usr/include/${MULTIARCH}"
+            echo "HOST_CFLAGS=${{ matrix.arch_flags }} -idirafter /usr/include -idirafter /usr/include/${MULTIARCH}"
             echo "PREFIX=$ROOT/prefix"
             echo "SRC=$ROOT/src"
             echo "OUT=$ROOT/out"
             echo "ARCH_DIR=${{ matrix.arch_dir }}"
           } >> "$GITHUB_ENV"
 
-      # 2. 恢复产物基线（增量构建前置条件）
+      # 恢复已有产物：二进制进 out/（增量构建时被新产物覆盖），
+      # 依赖库进 prefix/（xfsprogs/ntfs-3g 单独重建时直接链接，免重编 util-linux）
       - name: 恢复基线
         run: |
           set -euo pipefail
           if [[ -d "binaries/${ARCH_DIR}/grow" ]]; then
             cp -n "binaries/${ARCH_DIR}/grow/"* "$OUT/" 2>/dev/null || true
-            ls -1 "$OUT"
+            if [[ -d "binaries/${ARCH_DIR}/grow/libs" ]]; then
+              cp -a "binaries/${ARCH_DIR}/grow/libs/." "$PREFIX/"
+            fi
           fi
+          ls -1 "$OUT" || true
 
-      # 3. 计算构建计划
       - name: 计算计划
         env:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
           V_XFS:  ${{ github.event.inputs.xfsprogs_version }}
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
+          V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
+          V_LVM:  ${{ github.event.inputs.lvm2_version }}
         run: |
           set -euo pipefail
           U=$([[ -n "$V_UTIL" ]] && echo 1 || echo 0)
           E=$([[ -n "$V_E2FS" ]] && echo 1 || echo 0)
           X=$([[ -n "$V_XFS"  ]] && echo 1 || echo 0)
           N=$([[ -n "$V_NTFS" ]] && echo 1 || echo 0)
-          I=$([[ "$X$U" != "00" ]] && echo 1 || echo 0)
-          L=$([[ "$U$E$X$N" == "1111" ]] && echo 1 || echo 0)
+          B=$([[ -n "$V_BTRFS" ]] && echo 1 || echo 0)
+          G=$([[ -n "$V_LVM"  ]] && echo 1 || echo 0)
+          # btrfs-progs 链接 util-linux 的 libuuid/libblkid（prefix 依赖，
+          # 增量构建时不重编 util-linux 就没有库）→ 必须伴随 util-linux 一起构建
+          if [[ "$B" == "1" && "$U" != "1" ]]; then
+            echo "ERROR: btrfs-progs 依赖 util-linux 的 libuuid/libblkid，请同时填写 util_linux_version"; exit 1
+          fi
+          L=$([[ "$U$E$X$N$B$G" == "111111" ]] && echo 1 || echo 0)
           BINS=""
-          PKGS=""
-          [[ "$U" == "1" ]] && { BINS+=" sfdisk mkswap partx"; PKGS+=" util-linux"; }
-          [[ "$E" == "1" ]] && { BINS+=" e2fsck resize2fs";       PKGS+=" e2fsprogs";  }
-          [[ "$X" == "1" ]] && { BINS+=" xfs_growfs";              PKGS+=" xfsprogs";   }
-          [[ "$N" == "1" ]] && { BINS+=" ntfsresize";              PKGS+=" ntfs-3g";    }
-          BINS="${BINS# }"; PKGS="${PKGS# }"
+          [[ "$U" == "1" ]] && BINS+=" sfdisk mkswap partx"
+          [[ "$E" == "1" ]] && BINS+=" e2fsck resize2fs"
+          [[ "$X" == "1" ]] && BINS+=" xfs_growfs"
+          [[ "$N" == "1" ]] && BINS+=" ntfsresize"
+          [[ "$B" == "1" ]] && BINS+=" btrfs"
+          [[ "$G" == "1" ]] && BINS+=" lvm"
+          BINS="${BINS# }"
           {
             echo "BUILD_UTIL=$U"
             echo "BUILD_E2FS=$E"
             echo "BUILD_XFS=$X"
             echo "BUILD_NTFS=$N"
-            echo "NEED_INIH=$I"
+            echo "BUILD_BTRFS=$B"
+            echo "BUILD_LVM=$G"
             echo "REWRITE_LICENSES=$L"
             echo "EXPECTED_BINS=$BINS"
-            echo "BUILT_PKGS=$PKGS"
           } >> "$GITHUB_ENV"
-          echo "plan: U=$U E=$E X=$X N=$N inih=$I lic=$L bins=[$BINS]"
+          echo "plan: U=$U E=$E X=$X N=$N B=$B G=$G lic=$L bins=[$BINS]"
 
-      # 4. 下载源码
       - name: 下载源码
         env:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
           V_XFS:  ${{ github.event.inputs.xfsprogs_version }}
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
+          V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
+          V_LVM:  ${{ github.event.inputs.lvm2_version }}
         run: |
           set -euo pipefail
-          dl() { echo "FETCH $1"; curl -Lf --retry 3 -o "$1" "$2"; }
-          declare -a PIDS=() TAGS=()
-          push() { PIDS+=("$!"); TAGS+=("$1"); }
+          dl() { echo "FETCH $1 -> $2"; curl -Lf --retry 3 -o "$1" "$2" || { echo "FAILED $1 -> $2"; return 1; }; }
           cd "$SRC/.."
+          pids=""
+          if [[ "$BUILD_UTIL" == "1" ]]; then
+            dl util-linux.tar.xz "https://cdn.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz" &
+            pids="$pids $!"
+          fi
+          if [[ "$BUILD_E2FS" == "1" ]]; then
+            dl e2fsprogs.tar.gz "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz" &
+            pids="$pids $!"
+          fi
+          if [[ "$BUILD_XFS" == "1" ]]; then
+            dl xfsprogs.tar.xz "https://cdn.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.xz" &
+            pids="$pids $!"
+            dl urcu.tar.bz2 "https://lttng.org/files/urcu/userspace-rcu-${URCU_VERSION}.tar.bz2" &
+            pids="$pids $!"
+            dl inih.tar.gz "https://github.com/benhoyt/inih/archive/refs/tags/r${INIH_VERSION}.tar.gz" &
+            pids="$pids $!"
+          fi
+          if [[ "$BUILD_NTFS" == "1" ]]; then
+            dl ntfs-3g.tgz "https://download.tuxera.com/opensource/ntfs-3g_ntfsprogs-${V_NTFS}.tgz" &
+            pids="$pids $!"
+          fi
+          if [[ "$BUILD_BTRFS" == "1" ]]; then
+            dl btrfs-progs.tar.xz "https://cdn.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v${V_BTRFS}.tar.xz" &
+            pids="$pids $!"
+            dl zlib.tar.gz "https://zlib.net/fossils/zlib-${ZLIB_VERSION}.tar.gz" &
+            pids="$pids $!"
+          fi
+          if [[ "$BUILD_LVM" == "1" ]]; then
+            dl lvm2.tgz "https://sourceware.org/ftp/lvm2/releases/LVM2.${V_LVM}.tgz" &
+            pids="$pids $!"
+            dl libaio.tar.gz "https://ftp.debian.org/debian/pool/main/liba/libaio/libaio_${LIBAIO_VERSION}.orig.tar.gz" &
+            pids="$pids $!"
+          fi
+          for p in $pids; do wait "$p"; done
 
-          [[ "$BUILD_UTIL" == "1" ]] && { dl util-linux.tar.xz "https://www.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz" & push util-linux; } || true
-          [[ "$BUILD_E2FS" == "1" ]] && { dl e2fsprogs.tar.gz  "https://downloads.sourceforge.net/project/e2fsprogs/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz" & push e2fsprogs;  } || true
-          [[ "$BUILD_XFS"  == "1" ]] && { dl xfsprogs.tar.gz   "https://www.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.gz" & push xfsprogs;   } || true
-          [[ "$BUILD_NTFS" == "1" ]] && { dl ntfs-3g.tar.gz    "https://github.com/tuxera/ntfs-3g/archive/refs/tags/${V_NTFS}.tar.gz" & push ntfs-3g;    } || true
-          [[ "$NEED_INIH"  == "1" ]] && { dl inih.tar.gz       "https://github.com/benhoyt/inih/archive/refs/tags/r58.tar.gz" & push inih; } || true
-
-          rc=0
-          for i in "${!PIDS[@]}"; do wait "${PIDS[$i]}" || { echo "FAIL: ${TAGS[$i]}"; rc=1; }; done
-          [[ $rc -eq 0 ]] || exit $rc
-
-          [[ "$BUILD_UTIL" == "1" ]] && tar -xf util-linux.tar.xz -C "$SRC"
-          [[ "$BUILD_E2FS" == "1" ]] && tar -xf e2fsprogs.tar.gz  -C "$SRC"
-          [[ "$BUILD_XFS"  == "1" ]] && tar -xf xfsprogs.tar.gz   -C "$SRC"
-          [[ "$BUILD_NTFS" == "1" ]] && tar -xf ntfs-3g.tar.gz    -C "$SRC"
-          [[ "$NEED_INIH"  == "1" ]] && { tar -xf inih.tar.gz -C "$SRC"; mv "$SRC/inih-r58" "$SRC/inih"; }
+          # ntfs-3g 必须用 tuxera 官方发布包：GitHub 归档不含 configure
+          if [[ "$BUILD_UTIL" == "1" ]]; then tar -xf util-linux.tar.xz -C "$SRC"; fi
+          if [[ "$BUILD_E2FS" == "1" ]]; then tar -xf e2fsprogs.tar.gz -C "$SRC"; fi
+          if [[ "$BUILD_XFS"  == "1" ]]; then
+            tar -xf xfsprogs.tar.xz -C "$SRC"
+            tar -xf urcu.tar.bz2 -C "$SRC"
+            tar -xf inih.tar.gz -C "$SRC"
+            mv "$SRC/inih-r${INIH_VERSION}" "$SRC/inih"
+          fi
+          if [[ "$BUILD_NTFS" == "1" ]]; then tar -xf ntfs-3g.tgz -C "$SRC"; fi
+          if [[ "$BUILD_BTRFS" == "1" ]]; then
+            tar -xf btrfs-progs.tar.xz -C "$SRC"
+            tar -xf zlib.tar.gz -C "$SRC"
+          fi
+          if [[ "$BUILD_LVM" == "1" ]]; then
+            tar -xf lvm2.tgz -C "$SRC"
+            tar -xf libaio.tar.gz -C "$SRC"
+          fi
           ls -1 "$SRC"
 
-      # 5. 编译
       - name: 编译 inih
-        if: env.NEED_INIH == '1'
+        if: env.BUILD_XFS == '1'
         run: |
           set -euo pipefail
           mkdir -p "$PREFIX/lib/pkgconfig" "$PREFIX/include"
@@ -142,15 +205,29 @@ jobs:
           musl-gcc ${HOST_CFLAGS} -c ini.c -o ini.o
           ar rcs "$PREFIX/lib/libinih.a" ini.o
           cp ini.h "$PREFIX/include/"
-          pc="$PREFIX/lib/pkgconfig/inih.pc"
           {
             printf 'prefix=%s\n' "$PREFIX"
             echo 'Name: inih'
             echo 'Description: simple INI parser'
-            echo 'Version: 58'
+            echo 'Version: '"$INIH_VERSION"
             echo 'Libs: -L${prefix}/lib -linih'
             echo 'Cflags: -I${prefix}/include'
-          } > "$pc"
+          } > "$PREFIX/lib/pkgconfig/inih.pc"
+
+      - name: 编译 urcu
+        if: env.BUILD_XFS == '1'
+        run: |
+          set -euo pipefail
+          cd "$SRC/userspace-rcu-${URCU_VERSION}"
+          ./configure --prefix="$PREFIX" \
+            --disable-shared --enable-static \
+            CC=musl-gcc \
+            CPPFLAGS="${HOST_CPPFLAGS}" CFLAGS="${HOST_CFLAGS}" LDFLAGS=-static
+          # 只构建库：tests 测试程序用 g++ 静态链接会拉入 libgcc 的
+          # lse-init.o（引用 glibc 私有符号 __getauxval），且对我们毫无用处
+          make -C src -j"$(nproc)"
+          make -C include install
+          make -C src install
 
       - name: 编译 util-linux
         if: env.BUILD_UTIL == '1'
@@ -158,24 +235,30 @@ jobs:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
         run: |
           set -euo pipefail
-          export CC=musl-gcc
-          export CPPFLAGS="${HOST_CPPFLAGS}"
-          export CFLAGS="${HOST_CFLAGS}"
           cd "$SRC/util-linux-${V_UTIL}"
-          # util-linux 2.41 --disable-all-programs 后单个程序不再用 --enable-xxx
-          # （configure 会报 unrecognized），必须 make <target>。libxxx 仍然要
-          # --enable-* 开启，因为它们是 xfsprogs 静态链接依赖。
+          # 2.41.5 没有 sfdisk/mkswap 单程序开关：sfdisk 只能靠 --enable-fdisks
+          # 组开关（强制带 cfdisk 硬依赖 ncurses）；mkswap 在 --disable-all-programs
+          # 下被关闭且无覆盖。默认全量构建时三件套都自动启用，ncurses 系工具
+          # （cfdisk/ul/more/pg/setterm/irqtop）在 --without 下按 check 软跳过；
+          # lastlog2 要 glibc 的 libsqlite3 静态链接必炸，直接关掉；
+          # 库必须 make install 到 prefix，xfsprogs/ntfs-3g 靠它链接
           ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static \
-            --disable-all-programs \
+            --disable-liblastlog2 \
             --enable-libblkid --enable-libuuid --enable-libfdisk --enable-libsmartcols \
+            --without-tinfo --without-ncurses --without-ncursesw --without-readline \
             --without-python --without-systemd --without-systemdsystemunitdir \
-            --disable-bash-completion \
-            CPPFLAGS="${CPPFLAGS}" CFLAGS="${CFLAGS}" LDFLAGS=-static
-          make -j"$(nproc)" sfdisk mkswap partx
+            --disable-bash-completion --disable-nls \
+            --disable-makeinstall-chown --disable-makeinstall-setuid \
+            CC=musl-gcc \
+            CPPFLAGS="${HOST_CPPFLAGS}" CFLAGS="${HOST_CFLAGS}" LDFLAGS=-static
+          # libtool 会吞掉 -static（仅对 libtool 库生效，程序仍动态链 musl），
+          # 程序完全静态需 -all-static，make 命令行覆盖 configure 写入的值
+          make -j"$(nproc)" LDFLAGS=-all-static
+          make install
           for t in sfdisk mkswap partx; do
-            find . -name "$t" -type f -perm -u+x | head -1 | xargs -I{} cp {} "$OUT/"
+            cp "$(find "$PREFIX" -type f -name "$t" -print -quit)" "$OUT/"
           done
 
       - name: 编译 e2fsprogs
@@ -185,13 +268,18 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/e2fsprogs-${V_E2FS}"
-          mkdir -p build && cd build
-          ../configure --prefix="$PWD/sysroot" CC=musl-gcc \
+          # --enable-libuuid/--enable-libblkid = 用源码自带私有库（Alpine 的
+          # --disable 方向相反，是改用系统库），保证静态链接不沾 glibc
+          ./configure \
+            --prefix="$PREFIX" \
+            --disable-elf-shlibs \
+            --enable-libuuid --enable-libblkid \
+            --disable-fsck --disable-uuidd --disable-nls \
+            --with-udev-rules-dir=no \
+            CC=musl-gcc \
             CPPFLAGS="${HOST_CPPFLAGS}" CFLAGS="${HOST_CFLAGS}" LDFLAGS=-static
-          make -j"$(nproc)" e2fsck resize2fs
-          cd ..
-          find build -name e2fsck   -type f | head -1 | xargs -I{} cp {} "$OUT/"
-          find build -name resize2fs -type f | head -1 | xargs -I{} cp {} "$OUT/"
+          make -j"$(nproc)"
+          cp e2fsck/e2fsck resize/resize2fs "$OUT/"
 
       - name: 编译 xfsprogs
         if: env.BUILD_XFS == '1'
@@ -200,15 +288,22 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/xfsprogs-${V_XFS}"
-          export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
-          export CPPFLAGS="${HOST_CPPFLAGS}"
-          export CFLAGS="-I$PREFIX/include ${HOST_CFLAGS}"
-          ./configure --prefix="$PREFIX" CC=musl-gcc \
-            LDFLAGS="-static -L$PREFIX/lib" \
-            CPPFLAGS="${CPPFLAGS}" CFLAGS="${CFLAGS}" \
-            --disable-shared
-          make -j"$(nproc)" xfs_growfs
-          find . -name xfs_growfs -type f -perm -u+x | head -1 | xargs -I{} cp {} "$OUT/"
+          # 自定义构建系统：CPPFLAGS 被丢弃（-I 进 CFLAGS）；builddefs.in 把
+          # configure 写入的 LDFLAGS 清空为 LDFLAGS =，用 make 命令行覆盖
+          # （GNU Make 命令行变量优先级最高）传入 -all-static；
+          # ioctl_cxx_dummy.cpp 是 C++ 布局检查，走 CXXFLAGS（纯编译不链接）；
+          # musl 的 statx 定义与内核头冲突，OVERRIDE_SYSTEM_STATX 是 Alpine 同款规避
+          ./configure \
+            --prefix="$PREFIX" \
+            --disable-gettext \
+            CC=musl-gcc \
+            CPPFLAGS="-I$PREFIX/include ${HOST_CPPFLAGS}" \
+            CFLAGS="${HOST_CFLAGS} -I$PREFIX/include -DOVERRIDE_SYSTEM_STATX -DSTATX__RESERVED=0x80000000U" \
+            CXXFLAGS="-I$PREFIX/include -DOVERRIDE_SYSTEM_STATX -DSTATX__RESERVED=0x80000000U" \
+            LDFLAGS="-static -L$PREFIX/lib"
+          make -j"$(nproc)" headers
+          make -j"$(nproc)" growfs LDFLAGS="-all-static -L$PREFIX/lib"
+          cp growfs/xfs_growfs "$OUT/"
 
       - name: 编译 ntfs-3g
         if: env.BUILD_NTFS == '1'
@@ -217,30 +312,127 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/ntfs-3g-${V_NTFS}"
-          ./configure --prefix="$PWD/sysroot" CC=musl-gcc \
-            LDFLAGS=-static \
-            CPPFLAGS="${HOST_CPPFLAGS}" CFLAGS="${HOST_CFLAGS}" \
-            --disable-shared --enable-static --enable-ntfsprogs
-          make -j"$(nproc)" ntfsresize
-          find . -name ntfsresize -type f -perm -u+x | head -1 | xargs -I{} cp {} "$OUT/"
+          # --with-fuse=internal 用自带 fuse-lite，系统 libfuse 是 glibc 的不能静态链接
+          ./configure \
+            --prefix="$PREFIX" \
+            --with-fuse=internal \
+            --enable-ntfsprogs \
+            --disable-shared --enable-static \
+            CC=musl-gcc \
+            CPPFLAGS="-I$PREFIX/include ${HOST_CPPFLAGS}" \
+            CFLAGS="${HOST_CFLAGS}" \
+            LDFLAGS="-static -L$PREFIX/lib"
+          # 同 util-linux：libtool 程序链接需 -all-static 才是真正静态
+          make -j"$(nproc)" LDFLAGS="-all-static -L$PREFIX/lib"
+          cp ntfsprogs/ntfsresize "$OUT/"
 
-      # 6. 校验合并产物
+      - name: 编译 zlib
+        if: env.BUILD_BTRFS == '1'
+        run: |
+          set -euo pipefail
+          cd "$SRC/zlib-${ZLIB_VERSION}"
+          # zlib 自带 configure（非 autoconf），CC/CFLAGS 经环境变量传入；
+          # PKG_CONFIG 环境让后续 btrfs-progs 静态发现
+          CC=musl-gcc CFLAGS="${HOST_CFLAGS}" ./configure --static --prefix="$PREFIX"
+          make -j"$(nproc)" libz.a
+          make install
+
+      - name: 编译 libaio
+        if: env.BUILD_LVM == '1'
+        run: |
+          set -euo pipefail
+          cd "$SRC/libaio-${LIBAIO_VERSION}"
+          # libaio Makefile 直接支持 CC/AR/prefix 变量；静态库是 lvm 硬依赖
+          make -j"$(nproc)" CC=musl-gcc AR=ar CFLAGS="-O2 -I. ${HOST_CFLAGS}"
+          make prefix="$PREFIX" install
+
+      - name: 编译 LVM2
+        if: env.BUILD_LVM == '1'
+        env:
+          V_LVM: ${{ github.event.inputs.lvm2_version }}
+        run: |
+          set -euo pipefail
+          cd "$SRC/LVM2.${V_LVM}"
+          # Alpine lvm2 APKBUILD 同款缓存变量：musl 下 malloc(0)/realloc(0) 探测会误判
+          export ac_cv_func_malloc_0_nonnull=yes
+          export ac_cv_func_realloc_0_nonnull=yes
+          # musl 的 stdin/stdout/stderr 是 FILE *const（glibc 可写）：
+          # lvmcmdline.c 直接赋值三个标准流 → 编译错误；
+          # toolcontext.c 的行缓冲机制经 reopen_standard_stream(&stdin) 写穿
+          # const 指针存储 → 运行期 UB。Alpine 官方补丁：改用 freopen +
+          # glibc 专属缓冲逻辑包进 #ifdef __GLIBC__。上下文已对 2.03.42 核实可干净应用。
+          curl -fsSL -o /tmp/fix-stdio-usage.patch \
+            https://git.alpinelinux.org/aports/plain/main/lvm2/fix-stdio-usage.patch
+          patch -p1 --batch < /tmp/fix-stdio-usage.patch
+          ./configure \
+            --prefix="$PREFIX" \
+            --enable-static_link \
+            --enable-pkgconfig \
+            --disable-shared \
+            --disable-cmdlib \
+            --disable-dmeventd \
+            --disable-udev_sync \
+            --disable-readline \
+            --disable-selinux \
+            --disable-nls \
+            --with-blkid=none \
+            --with-systemdsystemunitdir=/dev/null \
+            CC=musl-gcc \
+            CFLAGS="${HOST_CFLAGS} -I$PREFIX/include" \
+            LDFLAGS="-static -L$PREFIX/lib"
+          # --disable-shared 关键：共享库版本脚本 .export.sym 依赖 libdm/make.tmpl 的
+          # .exported_symbols_generated，其预处理命令不带 CFLAGS/CPPFLAGS，
+          # musl-gcc 默认搜索路径无内核头 → linux/types.h 必挂；纯静态构建本就不需要共享库。
+          # 顶层 Makefile 没有 lvm 目标（旧 make lvm 是死代码），Alpine 同款全量 make。
+          make -j"$(nproc)"
+          # libdevmapper.a + libdevmapper.h + devmapper.pc 进 prefix（btrfs-progs 链接它）
+          make install_device-mapper
+          # lvm.static 是 --enable-static_link 的官方静态产物（Alpine lvm2-static 同款）
+          cp tools/lvm.static "$OUT/lvm"
+
+      - name: 编译 btrfs-progs
+        if: env.BUILD_BTRFS == '1'
+        env:
+          V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
+        run: |
+          set -euo pipefail
+          cd "$SRC/btrfs-progs-v${V_BTRFS}"
+          # PKG_CONFIG_LIBDIR 只搜 prefix：uuid/blkid（util-linux）、zlib、
+          # devmapper（LVM2 libdm）全部来自本流水线的静态库，杜绝 glibc 泄漏
+          export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
+          # musl 不支持 glibc 的 backtrace()/execinfo.h，必须显式关闭
+          # libudev 在 initramfs 中不是必须依赖，关闭可避免 findlib 报错
+          ./configure \
+            --prefix="$PREFIX" \
+            --disable-shared \
+            --disable-documentation \
+            --disable-backtrace \
+            --disable-libudev \
+            --disable-convert \
+            --disable-lzo \
+            --disable-zstd \
+            CC=musl-gcc \
+            CPPFLAGS="-I$PREFIX/include ${HOST_CPPFLAGS}" \
+            CFLAGS="${HOST_CFLAGS} -I$PREFIX/include" \
+            LDFLAGS="-static -L$PREFIX/lib"
+          make -j"$(nproc)" static
+          test -x btrfs.static
+          cp btrfs.static "$OUT/btrfs"
+
       - name: 校验产物
         run: |
           set -euo pipefail
           cd "$OUT"
           if [[ -z "$EXPECTED_BINS" ]]; then
             n=$(ls -1 | wc -l)
-            (( n >= 8 )) || { echo "ERROR: baseline 只有 $n 个文件，首次构建必须填齐 4 个版本"; exit 1; }
+            (( n >= 10 )) || { echo "ERROR: baseline 只有 $n 个文件，首次构建必须填齐 6 个版本"; exit 1; }
           else
             for t in $EXPECTED_BINS; do
               [[ -x "$t" ]] || { echo "ERROR: $t 未产出"; exit 1; }
               file "$t" | grep -q "statically linked" || { echo "ERROR: $t 非静态链接"; file "$t"; exit 1; }
+              strip --strip-all "$t"
             done
           fi
-          for t in sfdisk mkswap partx e2fsck resize2fs xfs_growfs ntfsresize; do
-            [[ -x "$t" ]] && strip --strip-all "$t" || true
-          done
           ls -lh
 
       - name: 生成 LICENSES
@@ -249,6 +441,8 @@ jobs:
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
           V_XFS:  ${{ github.event.inputs.xfsprogs_version }}
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
+          V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
+          V_LVM:  ${{ github.event.inputs.lvm2_version }}
         run: |
           set -euo pipefail
           cd "$OUT"
@@ -264,49 +458,85 @@ jobs:
           {
             echo "ImgFlash grow 静态工具链许可证说明"
             echo "================================"
-            echo "以下工具以 musl 静态链接构建，与 ImgFlash（MIT）为 mere aggregation。各二进制整体按 GPL-2.0-or-later 分发；完整源码版本与构建配方见 .github/workflows/grow-tools.yml。"
+            echo "以下工具以 musl 静态链接构建，与 ImgFlash（MIT）为 mere aggregation。"
+            echo "源码版本与构建配方见 .github/workflows/grow-tools.yml。"
             echo ""
-            for spec in \
-              "util-linux ${V_UTIL} https://www.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz" \
-              "e2fsprogs ${V_E2FS} https://downloads.sourceforge.net/project/e2fsprogs/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz" \
-              "xfsprogs ${V_XFS} https://www.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.gz" \
-              "ntfs-3g ${V_NTFS} https://github.com/tuxera/ntfs-3g/archive/refs/tags/${V_NTFS}.tar.gz"; do
-              # shellcheck disable=SC2086
-              set -- $spec
-              echo "## $1 $2"
-              echo "源码: $3"
-              echo ""
-            done
-            echo "许可证全文（上游 COPYING）："
+            echo "## util-linux ${V_UTIL} (GPL-2.0-or-later)"
+            echo "源码: https://cdn.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz"
+            echo "## e2fsprogs ${V_E2FS} (GPL-2.0 / LGPL-2.0)"
+            echo "源码: https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz"
+            echo "## xfsprogs ${V_XFS} (GPL-2.0)"
+            echo "源码: https://cdn.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.xz"
+            echo "## ntfs-3g ${V_NTFS} (GPL-2.0-or-later)"
+            echo "源码: https://download.tuxera.com/opensource/ntfs-3g_ntfsprogs-${V_NTFS}.tgz"
+            echo "## btrfs-progs ${V_BTRFS} (GPL-2.0)"
+            echo "源码: https://cdn.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v${V_BTRFS}.tar.xz"
+            echo "## LVM2 ${V_LVM} (GPL-2.0-or-later, libdm LGPL-2.1)"
+            echo "源码: https://sourceware.org/ftp/lvm2/releases/LVM2.${V_LVM}.tgz"
+            echo "## inih r${INIH_VERSION} (BSD-3-Clause) — xfsprogs 依赖"
+            echo "源码: https://github.com/benhoyt/inih/archive/refs/tags/r${INIH_VERSION}.tar.gz"
+            echo "## userspace-rcu ${URCU_VERSION} (LGPL-2.1-or-later) — xfsprogs 依赖"
+            echo "源码: https://lttng.org/files/urcu/userspace-rcu-${URCU_VERSION}.tar.bz2"
+            echo "## zlib ${ZLIB_VERSION} (Zlib) — btrfs-progs 依赖"
+            echo "源码: https://zlib.net/fossils/zlib-${ZLIB_VERSION}.tar.gz"
+            echo "## libaio ${LIBAIO_VERSION} (LGPL-2.1-or-later) — LVM2 依赖"
+            echo "源码: https://ftp.debian.org/debian/pool/main/liba/libaio/libaio_${LIBAIO_VERSION}.orig.tar.gz"
+            echo ""
+            echo "许可证全文（各源码包内自带）："
             echo ""
             echo "===== util-linux COPYING (GPL-2.0+) ====="
-            curl -Lf --retry 3 "https://raw.githubusercontent.com/util-linux/util-linux/v${V_UTIL}/COPYING"
+            cat "$SRC/util-linux-${V_UTIL}/COPYING"
             echo ""
-            echo "===== e2fsprogs COPYING (GPL-2.0) ====="
-            curl -Lf --retry 3 "https://raw.githubusercontent.com/tytso/e2fsprogs/v${V_E2FS}/COPYING"
+            echo "===== e2fsprogs NOTICE ====="
+            cat "$SRC/e2fsprogs-${V_E2FS}/NOTICE"
             echo ""
-            echo "===== xfsprogs LICENSE (GPL-2.0) ====="
-            curl -Lf --retry 3 "https://git.kernel.org/pub/scm/fs/xfs/xfsprogs-dev.git/plain/copying?h=v${V_XFS}"
+            echo "===== xfsprogs LICENSES/GPL-2.0 ====="
+            cat "$SRC/xfsprogs-${V_XFS}/LICENSES/GPL-2.0"
             echo ""
             echo "===== ntfs-3g COPYING (GPL-2.0+) ====="
-            curl -Lf --retry 3 "https://raw.githubusercontent.com/tuxera/ntfs-3g/${V_NTFS}/COPYING"
+            cat "$SRC/ntfs-3g-${V_NTFS}/COPYING"
+            echo ""
+            echo "===== btrfs-progs COPYING (GPL-2.0) ====="
+            cat "$SRC/btrfs-progs-v${V_BTRFS}/COPYING"
+            echo ""
+            echo "===== LVM2 COPYING (GPL-2.0+) ====="
+            cat "$SRC/LVM2.${V_LVM}/COPYING"
+            echo ""
+            echo "===== libdm COPYING.LIB (LGPL-2.1+) ====="
+            cat "$SRC/LVM2.${V_LVM}/COPYING.LIB"
+            echo ""
+            echo "===== inih LICENSE.txt (BSD-3) ====="
+            cat "$SRC/inih/LICENSE.txt"
+            echo ""
+            echo "===== userspace-rcu LICENSE.md (LGPL-2.1+) ====="
+            cat "$SRC/userspace-rcu-${URCU_VERSION}/LICENSE.md"
+            echo ""
+            echo "===== zlib 许可证 (Zlib) ====="
+            sed -n '/^Copyright (C) 1995-/,/^Altered source versions/p' "$SRC/zlib-${ZLIB_VERSION}/README"
+            echo ""
+            echo "===== libaio COPYING (LGPL-2.1) ====="
+            cat "$SRC/libaio-${LIBAIO_VERSION}/COPYING"
           } > LICENSES.txt
           wc -l LICENSES.txt
 
-      # 7. 发布
       - name: 发布
         env:
           V_UTIL: ${{ github.event.inputs.util_linux_version }}
           V_E2FS: ${{ github.event.inputs.e2fsprogs_version }}
           V_XFS:  ${{ github.event.inputs.xfsprogs_version }}
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
+          V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
+          V_LVM:  ${{ github.event.inputs.lvm2_version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          mkdir -p "binaries/${ARCH_DIR}/grow"
-          for f in "$OUT"/*; do [[ -e "$f" ]] && cp -f "$f" "binaries/${ARCH_DIR}/grow/" || true; done
-          git add "binaries/${ARCH_DIR}/grow/"
+          DEST="binaries/${ARCH_DIR}/grow"
+          mkdir -p "$DEST"
+          # 只发布独立二进制（musl 全静态，无需任何运行时库）
+          # prefix 里的 .a 静态库和头文件是构建中间产物，不入库
+          cp -f "$OUT"/* "$DEST/"
+          git add "$DEST"
           if git diff --cached --quiet; then
             echo "No changes to commit"
             exit 0
@@ -316,8 +546,10 @@ jobs:
           [[ -n "$V_E2FS" ]] && S+=", e2fsprogs ${V_E2FS}"
           [[ -n "$V_XFS"  ]] && S+=", xfsprogs ${V_XFS}"
           [[ -n "$V_NTFS" ]] && S+=", ntfs-3g ${V_NTFS}"
+          [[ -n "$V_BTRFS" ]] && S+=", btrfs-progs ${V_BTRFS}"
+          [[ -n "$V_LVM" ]] && S+=", LVM2 ${V_LVM}"
           S="${S#, }"
           [[ -z "$S" ]] && S="(housekeeping only, no package rebuild)"
           git commit -m "chore: update grow tools ${ARCH_DIR} (${S})"
-          git pull --rebase || true
+          git pull --rebase
           git push

@@ -1,6 +1,7 @@
 use anyhow::Context;
 
-use crate::app::{App, ConfirmButton, Screen, SuccessAction, WriteProgress};
+use crate::app::{App, ConfirmButton, GrowProgress, Screen, SuccessAction, WriteProgress};
+use crate::grow::{self, GrowOutcome};
 
 pub fn handle_key_events(key: crossterm::event::KeyEvent, app: &mut App) -> anyhow::Result<()> {
     // Help overlay: any key dismisses
@@ -13,6 +14,9 @@ pub fn handle_key_events(key: crossterm::event::KeyEvent, app: &mut App) -> anyh
         Screen::DiskList => handle_disk_list(key, app),
         Screen::Confirmation => handle_confirmation(key, app),
         Screen::Writing => handle_writing(key, app),
+        // No abort during grow: killing the child mid-sfdisk would deliberately
+        // create the torn partition-table window (accepted only for power loss)
+        Screen::Growing => Ok(()),
         Screen::WriteError => handle_write_error(key, app),
         Screen::Success => handle_success(key, app),
     }
@@ -244,11 +248,100 @@ pub fn poll_dd_progress(app: &mut App) {
 
     match process_status {
         Some(true) => {
-            app.goto_success();
+            // dd success → grow (if enabled) → Success; grow never blocks reboot
+            if grow::quick_enabled() {
+                start_grow(app);
+            } else {
+                app.goto_success();
+            }
         }
         Some(false) => {
             app.goto_write_error();
         }
         None => {}
     }
+}
+
+// ── Start grow subprocess ───────────────────────────────────────────────
+//
+// Spawns /proc/self/exe --grow <disk> after a successful dd write.
+// Same self-fork pattern as start_write: process isolation, and the
+// outcome is reported via /run/grow.result (atomic writes).
+
+fn start_grow(app: &mut App) {
+    let disk_name = app.progress.as_ref()
+        .map(|p| p.disk_name.clone())
+        .unwrap_or_default();
+
+    // Delete stale IPC files from any earlier run so the result we read
+    // later can only belong to this run
+    for f in [grow::STATUS_FILE, grow::RESULT_FILE, grow::LOG_FILE] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    match std::process::Command::new("/proc/self/exe")
+        .arg("--grow")
+        .arg(format!("/dev/{}", disk_name))
+        .spawn()
+    {
+        Ok(child) => {
+            app.goto_growing(GrowProgress::new(&disk_name, child));
+        }
+        Err(_) => {
+            // Spawn failure = infrastructure fault: record Failed and move on
+            app.grow_outcome = Some(GrowOutcome {
+                status: "failed".to_string(),
+                device: format!("/dev/{}", disk_name),
+                reason: "failed to spawn grow process".to_string(),
+                ..GrowOutcome::default()
+            });
+            app.goto_success();
+        }
+    }
+}
+
+// ── Poll grow progress (called every tick) ──────────────────────────────
+
+pub fn poll_grow_progress(app: &mut App) {
+    if app.screen != Screen::Growing {
+        return;
+    }
+    let Some(g) = app.grow.as_mut() else {
+        return;
+    };
+
+    g.poll_status();
+    let exited = g.child_exited();
+    let timed_out = !exited && g.stalled_for() > grow::HANG_TIMEOUT;
+    if !exited && !timed_out {
+        return;
+    }
+    let disk_name = g.disk_name.clone();
+    // borrow of `g` ends here — `app` is fully available again
+
+    let outcome = if exited {
+        // Child exited: result must exist (atomic write precedes exit);
+        // missing result = crash → synthesize Failed
+        grow::read_result().unwrap_or_else(|| GrowOutcome {
+            status: "failed".to_string(),
+            device: format!("/dev/{}", disk_name),
+            reason: "grow process exited without result".to_string(),
+            ..GrowOutcome::default()
+        })
+    } else {
+        // Hang: no status change for HANG_TIMEOUT while still running.
+        // The child is NOT killed — a kill mid-sfdisk would deliberately
+        // create the torn partition-table window; reboot carries the same
+        // accepted risk.
+        GrowOutcome {
+            status: "failed".to_string(),
+            device: format!("/dev/{}", disk_name),
+            reason: "grow timed out (no progress)".to_string(),
+            ..GrowOutcome::default()
+        }
+    };
+
+    // Disabled is internal: no grow line on the Success screen
+    app.grow_outcome = (outcome.status != "disabled").then_some(outcome);
+    app.goto_success();
 }

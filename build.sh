@@ -40,6 +40,22 @@ esac
 SIGNED_PKGS="${KERNEL_PKG},${GRUB_PKG}"
 [[ "${ENABLE_SECURE_BOOT:-0}" == "1" ]] && SIGNED_PKGS="${KERNEL_PKG},${SHIM_PKG},${GRUB_PKG}"
 
+# --- grow：fs 内核模块按 GROW_TOOLS 条目注入（必须在 REQUIRED_MODULES 计算前）---
+# xfs/btrfs 在线扩容需 mount（内核驱动）；lvm 需 device-mapper
+# crc32c_generic 前置于 xfs/btrfs：libcrc32c 有 softdep(pre: crc32c)，busybox modprobe
+# 不解析 modules.softdep，不显式先载则 libcrc32c init 时找不到 "crc32c" 算法而失败
+if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic xfs"
+    fi
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic btrfs"
+    fi
+    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm; then
+        MOD_FILESYSTEM="${MOD_FILESYSTEM} dm-mod"
+    fi
+fi
+
 BASE_MODULES="${MOD_FILESYSTEM} ${MOD_NLS} ${MOD_ATA} ${MOD_USB} ${MOD_CDROM} ${MOD_INPUT} ${MOD_EMMC} ${MOD_EMMC_CARDREADER} ${MOD_EMMC_USB:-}"
 OPT_NVME=$([[ "${INCLUDE_NVME}" != "0" ]] && echo "${MOD_NVME}" || echo "")
 OPT_VIRT=$([[ "${INCLUDE_VIRT}" != "0" ]] && echo "${MOD_VIRT}" || echo "")
@@ -274,6 +290,8 @@ if [[ "${USE_TUI}" == "1" ]]; then
     cp "${SCRIPT_DIR}/binaries/disktui-lite" "${INITRAMFS_DIR}/usr/bin/disktui-lite"
     chmod +x "${INITRAMFS_DIR}/usr/bin/disktui-lite"
     ln -s /usr/bin/disktui-lite "${INITRAMFS_DIR}/init"
+
+    # --- grow 模块注入已前移至 REQUIRED_MODULES 计算处（脚本开头）---
 # else
 #     cp /bin/busybox "${INITRAMFS_DIR}/bin/busybox"
 #     chmod +x "${INITRAMFS_DIR}/bin/busybox"
@@ -372,6 +390,53 @@ mkdir -p "${ISO_DIR}/boot"
 mv "${VMLINUZ}" "${ISO_DIR}/boot/vmlinuz"
 mv "${BUILD_DIR}/initrd.img" "${ISO_DIR}/boot/initrd.img"
 mv "${BUILD_DIR}/image.squashfs" "${ISO_DIR}/image.squashfs"
+
+# --- grow 全家桶注入 ISO 根 /grow/（conf + 按 GROW_TOOLS 工具 + 许可证） ---
+if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
+    GROW_BIN_DIR="${SCRIPT_DIR}/binaries/${ARCH^^}/grow"
+    [[ -d "${GROW_BIN_DIR}" ]] || die "GROW_ENABLED=1 但缺少 ${GROW_BIN_DIR}，请先运行 grow-tools workflow"
+
+    GROW_STAGE="${ISO_DIR}/grow"
+    mkdir -p "${GROW_STAGE}"
+    printf 'enabled=1\npart=%s\n' "${GROW_PART:-auto}" > "${GROW_STAGE}/grow.conf"
+
+    grow_tool_enabled() {
+        tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq "$1"
+    }
+
+    for t in sfdisk mkswap partx; do
+        [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "grow 基础工具 ${t} 缺失"
+        cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
+    done
+    if grow_tool_enabled ext4; then
+        for t in e2fsck resize2fs; do
+            [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "GROW_TOOLS=ext4 但 ${t} 缺失"
+            cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
+        done
+    fi
+    if grow_tool_enabled xfs; then
+        [[ -f "${GROW_BIN_DIR}/xfs_growfs" ]] || die "GROW_TOOLS=xfs 但 xfs_growfs 缺失"
+        cp "${GROW_BIN_DIR}/xfs_growfs" "${GROW_STAGE}/"
+    fi
+    if grow_tool_enabled ntfs; then
+        [[ -f "${GROW_BIN_DIR}/ntfsresize" ]] || die "GROW_TOOLS=ntfs 但 ntfsresize 缺失"
+        cp "${GROW_BIN_DIR}/ntfsresize" "${GROW_STAGE}/"
+    fi
+    if grow_tool_enabled btrfs; then
+        [[ -f "${GROW_BIN_DIR}/btrfs" ]] || die "GROW_TOOLS=btrfs 但 btrfs 缺失"
+        cp "${GROW_BIN_DIR}/btrfs" "${GROW_STAGE}/"
+    fi
+    if grow_tool_enabled lvm; then
+        [[ -f "${GROW_BIN_DIR}/lvm" ]] || die "GROW_TOOLS=lvm 但 lvm 缺失"
+        cp "${GROW_BIN_DIR}/lvm" "${GROW_STAGE}/"
+    fi
+
+    # 粗粒度 fail-fast：覆盖值必须真实存在（sfdisk 对镜像文件可用）
+    if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then
+        sfdisk -d "${IMAGE_SRC}" 2>/dev/null | grep -q "image.img${GROW_PART} :" \
+            || die "GROW_PART=${GROW_PART} 在镜像中不存在"
+    fi
+fi
 
 # --- BIOS 引导（syslinux，仅 amd64） ---
 if [[ "${HAS_BIOS}" -eq 1 ]]; then

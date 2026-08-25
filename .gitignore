@@ -1,0 +1,21 @@
+# Rust build — 禁止提交 target
+disktui-lite/target/
+**/target/
+
+# Cargo.lock — 你明确要求不提交
+**/Cargo.lock
+
+# Trae 私有工作文件
+.trae/
+*.log
+log
+
+# 构建产物
+output/
+build/
+
+# IDE / OS 噪音
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

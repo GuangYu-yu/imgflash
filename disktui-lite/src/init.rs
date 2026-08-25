@@ -13,7 +13,7 @@ use anyhow::bail;
 
 const MAX_SCAN_TRIES: u32 = 10;
 const SCAN_INTERVAL_SECS: u64 = 1;
-const BOOT_MEDIA_DIR: &str = "/media/cdrom";
+pub(crate) const BOOT_MEDIA_DIR: &str = "/media/cdrom";
 const IMAGE_DIR: &str = "/image";
 const SQUASHFS_FILE: &str = "/media/cdrom/image.squashfs";
 const DEVICE_PREFIXES: [&str; 6] = ["sr", "sd", "nvme", "vd", "hd", "mmcblk"];
