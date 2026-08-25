@@ -400,19 +400,21 @@ jobs:
           # PKG_CONFIG_LIBDIR 只搜 prefix：uuid/blkid（util-linux）、zlib、
           # devmapper（LVM2 libdm）全部来自本流水线的静态库，杜绝 glibc 泄漏
           export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
-          # btrfs-progs 7.x 起使用 make static 而非 make btrfs.static
-          # crypto 不再强制 builtin，使用默认或系统库
+          # musl 不支持 glibc 的 backtrace()/execinfo.h，必须显式关闭
           ./configure \
             --prefix="$PREFIX" \
             --disable-shared \
             --disable-documentation \
+            --disable-backtrace \
             --disable-convert \
-            --disable-lzo --disable-zstd \
+            --disable-lzo \
+            --disable-zstd \
             CC=musl-gcc \
             CPPFLAGS="-I$PREFIX/include ${HOST_CPPFLAGS}" \
             CFLAGS="${HOST_CFLAGS} -I$PREFIX/include" \
             LDFLAGS="-static -L$PREFIX/lib"
           make -j"$(nproc)" static
+          test -x btrfs.static
           cp btrfs.static "$OUT/btrfs"
 
       - name: 校验产物
