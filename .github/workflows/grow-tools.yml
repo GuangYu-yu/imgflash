@@ -147,7 +147,7 @@ jobs:
             pids="$pids $!"
           fi
           if [[ "$BUILD_E2FS" == "1" ]]; then
-            dl e2fsprogs.tar.gz "https://cdn.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz" &
+            dl e2fsprogs.tar.gz "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz" &
             pids="$pids $!"
           fi
           if [[ "$BUILD_XFS" == "1" ]]; then
@@ -171,7 +171,7 @@ jobs:
           if [[ "$BUILD_LVM" == "1" ]]; then
             dl lvm2.tgz "https://sourceware.org/ftp/lvm2/releases/LVM2.${V_LVM}.tgz" &
             pids="$pids $!"
-            dl libaio.tar.gz "https://deb.debian.org/debian/pool/main/liba/libaio/libaio_${LIBAIO_VERSION}.orig.tar.gz" &
+            dl libaio.tar.gz "https://ftp.debian.org/debian/pool/main/liba/libaio/libaio_${LIBAIO_VERSION}.orig.tar.gz" &
             pids="$pids $!"
           fi
           for p in $pids; do wait "$p"; done
@@ -443,7 +443,7 @@ jobs:
             echo "## util-linux ${V_UTIL} (GPL-2.0-or-later)"
             echo "源码: https://cdn.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz"
             echo "## e2fsprogs ${V_E2FS} (GPL-2.0 / LGPL-2.0)"
-            echo "源码: https://cdn.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz"
+            echo "源码: https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz"
             echo "## xfsprogs ${V_XFS} (GPL-2.0)"
             echo "源码: https://cdn.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.xz"
             echo "## ntfs-3g ${V_NTFS} (GPL-2.0-or-later)"
@@ -459,7 +459,7 @@ jobs:
             echo "## zlib ${ZLIB_VERSION} (Zlib) — btrfs-progs 依赖"
             echo "源码: https://cdn.kernel.org/pub/linux/libs/zlib/zlib-${ZLIB_VERSION}.tar.xz"
             echo "## libaio ${LIBAIO_VERSION} (LGPL-2.1-or-later) — LVM2 依赖"
-            echo "源码: https://deb.debian.org/debian/pool/main/liba/libaio/libaio_${LIBAIO_VERSION}.orig.tar.gz"
+            echo "源码: https://ftp.debian.org/debian/pool/main/liba/libaio/libaio_${LIBAIO_VERSION}.orig.tar.gz"
             echo ""
             echo "许可证全文（各源码包内自带）："
             echo ""
