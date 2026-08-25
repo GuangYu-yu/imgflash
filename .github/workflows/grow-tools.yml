@@ -353,41 +353,34 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/LVM2.${V_LVM}"
-          MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-          # musl-gcc 保持自己的 musl libc headers；
-          # Linux userspace kernel headers 单独放到 after 路径，
-          # 避免 /usr/include 中的 glibc headers 污染 musl。
-          export CPPFLAGS="\
-            -I$PREFIX/include \
-            -idirafter /usr/include \
-            -idirafter /usr/include/${MULTIARCH} \
-            -idirafter /usr/include/asm-generic"
-          export CFLAGS="${HOST_CFLAGS} -I$PREFIX/include"
-          export LDFLAGS="-static -L$PREFIX/lib"
-          # 确认 musl-gcc 同时能看到：
-          # 1. musl 自己的 signal.h
-          # 2. Ubuntu linux-libc-dev 提供的 linux/types.h
-          printf '#include <signal.h>\n' |
-            musl-gcc ${CPPFLAGS} -E - >/dev/null
-          printf '#include <linux/types.h>\n' |
-            musl-gcc ${CPPFLAGS} -E - >/dev/null
+          # Alpine lvm2 APKBUILD 同款缓存变量：musl 下 malloc(0)/realloc(0) 探测会误判
+          export ac_cv_func_malloc_0_nonnull=yes
+          export ac_cv_func_realloc_0_nonnull=yes
           ./configure \
             --prefix="$PREFIX" \
             --enable-static_link \
+            --enable-pkgconfig \
+            --disable-shared \
             --disable-cmdlib \
             --disable-dmeventd \
             --disable-udev_sync \
+            --disable-readline \
             --disable-selinux \
             --disable-nls \
             --with-blkid=none \
             --with-systemdsystemunitdir=/dev/null \
-            CC=musl-gcc
-          # 构建 libdevmapper.a
-          make -j"$(nproc)" device-mapper
+            CC=musl-gcc \
+            CFLAGS="${HOST_CFLAGS} -I$PREFIX/include" \
+            LDFLAGS="-static -L$PREFIX/lib"
+          # --disable-shared 关键：共享库版本脚本 .export.sym 依赖 libdm/make.tmpl 的
+          # .exported_symbols_generated，其预处理命令不带 CFLAGS/CPPFLAGS，
+          # musl-gcc 默认搜索路径无内核头 → linux/types.h 必挂；纯静态构建本就不需要共享库。
+          # 顶层 Makefile 没有 lvm 目标（旧 make lvm 是死代码），Alpine 同款全量 make。
+          make -j"$(nproc)"
+          # libdevmapper.a + libdevmapper.h + devmapper.pc 进 prefix（btrfs-progs 链接它）
           make install_device-mapper
-          # 构建静态 lvm
-          make -j"$(nproc)" lvm
-          cp tools/lvm "$OUT/lvm"
+          # lvm.static 是 --enable-static_link 的官方静态产物（Alpine lvm2-static 同款）
+          cp tools/lvm.static "$OUT/lvm"
 
       - name: 编译 btrfs-progs
         if: env.BUILD_BTRFS == '1'
