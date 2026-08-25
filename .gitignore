@@ -2,7 +2,7 @@
 disktui-lite/target/
 **/target/
 
-# Cargo.lock — 你明确要求不提交
+# Cargo.lock
 **/Cargo.lock
 
 # Trae 私有工作文件
