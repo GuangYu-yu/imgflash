@@ -33,8 +33,12 @@ jobs:
         include:
           - arch_dir: AMD64
             runner: ubuntu-latest
+            arch_flags: ""
           - arch_dir: ARM64
             runner: ubuntu-24.04-arm
+            # aarch64 musl 静态链接：libgcc 的 lse-init.o 引用 glibc 私有符号
+            # __getauxval，必须关 outline atomics 才不拉入
+            arch_flags: "-mno-outline-atomics"
 
     steps:
       - name: 检出
@@ -54,7 +58,7 @@ jobs:
           mkdir -p "$ROOT/src" "$ROOT/out" "$ROOT/prefix"
           {
             echo "HOST_CPPFLAGS=-idirafter /usr/include -idirafter /usr/include/${MULTIARCH}"
-            echo "HOST_CFLAGS=-idirafter /usr/include -idirafter /usr/include/${MULTIARCH}"
+            echo "HOST_CFLAGS=${{ matrix.arch_flags }} -idirafter /usr/include -idirafter /usr/include/${MULTIARCH}"
             echo "PREFIX=$ROOT/prefix"
             echo "SRC=$ROOT/src"
             echo "OUT=$ROOT/out"
@@ -175,8 +179,11 @@ jobs:
             --disable-shared --enable-static \
             CC=musl-gcc \
             CPPFLAGS="${HOST_CPPFLAGS}" CFLAGS="${HOST_CFLAGS}" LDFLAGS=-static
-          make -j"$(nproc)"
-          make install
+          # 只构建库：tests 测试程序用 g++ 静态链接会拉入 libgcc 的
+          # lse-init.o（引用 glibc 私有符号 __getauxval），且对我们毫无用处
+          make -C src -j"$(nproc)"
+          make -C include install
+          make -C src install
 
       - name: 编译 util-linux
         if: env.BUILD_UTIL == '1'
@@ -185,14 +192,15 @@ jobs:
         run: |
           set -euo pipefail
           cd "$SRC/util-linux-${V_UTIL}"
-          # --disable-all-programs 后没有 --enable-sfdisk 单独开关，
-          # sfdisk 归 --enable-fdisks 组；库必须 make install 到 prefix，
-          # xfsprogs/ntfs-3g 靠它链接
+          # 官方按需构建方式：--disable-all-programs 后用 --enable-<name>
+          # 单程序开关（howto-compilation.txt），不能用 --enable-fdisks——
+          # 那个组强制带上 cfdisk，会引入 ncurses 依赖；
+          # 库必须 make install 到 prefix，xfsprogs/ntfs-3g 靠它链接
           ./configure \
             --prefix="$PREFIX" \
             --disable-shared --enable-static \
             --disable-all-programs \
-            --enable-fdisks --enable-partx \
+            --enable-sfdisk --enable-mkswap --enable-partx \
             --enable-libblkid --enable-libuuid --enable-libfdisk --enable-libsmartcols \
             --without-tinfo --without-ncurses --without-ncursesw --without-readline \
             --without-python --without-systemd --without-systemdsystemunitdir \
@@ -203,7 +211,7 @@ jobs:
           make -j"$(nproc)"
           make install
           for t in sfdisk mkswap partx; do
-            find "$PREFIX" -type f -name "$t" | head -1 | xargs -I{} cp {} "$OUT/"
+            cp "$(find "$PREFIX" -type f -name "$t" -print -quit)" "$OUT/"
           done
 
       - name: 编译 e2fsprogs
