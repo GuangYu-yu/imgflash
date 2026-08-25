@@ -143,15 +143,15 @@ jobs:
           cd "$SRC/.."
           pids=""
           if [[ "$BUILD_UTIL" == "1" ]]; then
-            dl util-linux.tar.xz "https://www.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz" &
+            dl util-linux.tar.xz "https://cdn.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz" &
             pids="$pids $!"
           fi
           if [[ "$BUILD_E2FS" == "1" ]]; then
-            dl e2fsprogs.tar.gz "https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz" &
+            dl e2fsprogs.tar.gz "https://cdn.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz" &
             pids="$pids $!"
           fi
           if [[ "$BUILD_XFS" == "1" ]]; then
-            dl xfsprogs.tar.xz "https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.xz" &
+            dl xfsprogs.tar.xz "https://cdn.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.xz" &
             pids="$pids $!"
             dl urcu.tar.bz2 "https://lttng.org/files/urcu/userspace-rcu-${URCU_VERSION}.tar.bz2" &
             pids="$pids $!"
@@ -163,9 +163,9 @@ jobs:
             pids="$pids $!"
           fi
           if [[ "$BUILD_BTRFS" == "1" ]]; then
-            dl btrfs-progs.tar.xz "https://www.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v${V_BTRFS}.tar.xz" &
+            dl btrfs-progs.tar.xz "https://cdn.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v${V_BTRFS}.tar.xz" &
             pids="$pids $!"
-            dl zlib.tar.xz "https://www.kernel.org/pub/linux/libs/zlib/zlib-${ZLIB_VERSION}.tar.xz" &
+            dl zlib.tar.xz "https://cdn.kernel.org/pub/linux/libs/zlib/zlib-${ZLIB_VERSION}.tar.xz" &
             pids="$pids $!"
           fi
           if [[ "$BUILD_LVM" == "1" ]]; then
@@ -441,15 +441,15 @@ jobs:
             echo "源码版本与构建配方见 .github/workflows/grow-tools.yml。"
             echo ""
             echo "## util-linux ${V_UTIL} (GPL-2.0-or-later)"
-            echo "源码: https://www.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz"
+            echo "源码: https://cdn.kernel.org/pub/linux/utils/util-linux/v${V_UTIL%.*}/util-linux-${V_UTIL}.tar.xz"
             echo "## e2fsprogs ${V_E2FS} (GPL-2.0 / LGPL-2.0)"
-            echo "源码: https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz"
+            echo "源码: https://cdn.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${V_E2FS}/e2fsprogs-${V_E2FS}.tar.gz"
             echo "## xfsprogs ${V_XFS} (GPL-2.0)"
-            echo "源码: https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.xz"
+            echo "源码: https://cdn.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-${V_XFS}.tar.xz"
             echo "## ntfs-3g ${V_NTFS} (GPL-2.0-or-later)"
             echo "源码: https://download.tuxera.com/opensource/ntfs-3g_ntfsprogs-${V_NTFS}.tgz"
             echo "## btrfs-progs ${V_BTRFS} (GPL-2.0)"
-            echo "源码: https://www.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v${V_BTRFS}.tar.xz"
+            echo "源码: https://cdn.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v${V_BTRFS}.tar.xz"
             echo "## LVM2 ${V_LVM} (GPL-2.0-or-later, libdm LGPL-2.1)"
             echo "源码: https://sourceware.org/ftp/lvm2/releases/LVM2.${V_LVM}.tgz"
             echo "## inih r${INIH_VERSION} (BSD-3-Clause) — xfsprogs 依赖"
@@ -457,7 +457,7 @@ jobs:
             echo "## userspace-rcu ${URCU_VERSION} (LGPL-2.1-or-later) — xfsprogs 依赖"
             echo "源码: https://lttng.org/files/urcu/userspace-rcu-${URCU_VERSION}.tar.bz2"
             echo "## zlib ${ZLIB_VERSION} (Zlib) — btrfs-progs 依赖"
-            echo "源码: https://www.kernel.org/pub/linux/libs/zlib/zlib-${ZLIB_VERSION}.tar.xz"
+            echo "源码: https://cdn.kernel.org/pub/linux/libs/zlib/zlib-${ZLIB_VERSION}.tar.xz"
             echo "## libaio ${LIBAIO_VERSION} (LGPL-2.1-or-later) — LVM2 依赖"
             echo "源码: https://deb.debian.org/debian/pool/main/liba/libaio/libaio_${LIBAIO_VERSION}.orig.tar.gz"
             echo ""
