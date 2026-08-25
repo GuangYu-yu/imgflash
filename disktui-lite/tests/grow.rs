@@ -112,7 +112,7 @@ fn temp_img(name: &str, img: &[u8]) -> PathBuf {
 }
 
 fn enabled_policy() -> GrowPolicy {
-    GrowPolicy { enabled: true, part: PartSpec::Auto }
+    GrowPolicy { enabled: true, part: PartSpec::Auto, lv: None }
 }
 
 // ── 策略解析 ────────────────────────────────────────────────────────────
@@ -126,10 +126,11 @@ fn policy_defaults_when_file_missing() {
 
 #[test]
 fn policy_parses_known_keys() {
-    let path = temp_img("conf", b"enabled=1\npart=3\n");
+    let path = temp_img("conf", b"enabled=1\npart=3\nlv=root\n");
     let p = load_policy_from(&path);
     assert!(p.enabled);
     assert_eq!(p.part, PartSpec::Number(3));
+    assert_eq!(p.lv.as_deref(), Some("root"));
     let _ = std::fs::remove_file(&path);
 }
 
@@ -294,6 +295,19 @@ fn read_swap_info_extracts_uuid_and_label() {
 fn read_swap_info_rejects_non_swap() {
     let img = vec![0u8; 8192];
     assert!(read_swap_info(&mut Cursor::new(img), 0).is_none());
+}
+
+#[test]
+fn read_swap_info_and_sniff_support_64k_pages() {
+    // aarch64 64K pages 内核：魔数在 65526（页尾-10）
+    let mut img = vec![0u8; 65536];
+    let uuid = [0xABu8; 16];
+    let b = 0usize;
+    img[b + 65526..b + 65536].copy_from_slice(b"SWAPSPACE2");
+    img[b + 1036..b + 1052].copy_from_slice(&uuid);
+    let si = read_swap_info(&mut Cursor::new(img.clone()), 0).unwrap();
+    assert_eq!(si.uuid, "abababab-abab-abab-abab-abababababab");
+    assert_eq!(sniff_fs(&mut Cursor::new(img), 0), FsKind::Swap);
 }
 
 // ── 分析决策 ────────────────────────────────────────────────────────────
@@ -477,7 +491,7 @@ fn analyze_declared_part_mismatch_skips() {
     let mut img = mbr_disk(&[(0x83, 2048, 4096)], 10000);
     put_ext4(&mut img, 2048 * S, 0);
     let path = temp_img("img", &img);
-    let policy = GrowPolicy { enabled: true, part: PartSpec::Number(2) };
+    let policy = GrowPolicy { enabled: true, part: PartSpec::Number(2), lv: None };
     let plan = analyze_with(&path, "sda", 10000, &policy);
     assert!(plan.action.is_none());
     assert!(plan.skip_reason.as_deref().unwrap().contains("not the growth candidate"));
@@ -489,7 +503,7 @@ fn analyze_declared_part_matching_candidate_proceeds() {
     let mut img = mbr_disk(&[(0x83, 2048, 4096)], 10000);
     put_ext4(&mut img, 2048 * S, 0);
     let path = temp_img("img", &img);
-    let policy = GrowPolicy { enabled: true, part: PartSpec::Number(1) };
+    let policy = GrowPolicy { enabled: true, part: PartSpec::Number(1), lv: None };
     let plan = analyze_with(&path, "sda", 10000, &policy);
     assert!(plan.action.is_some(), "declared part matching candidate should grow");
     let _ = std::fs::remove_file(&path);

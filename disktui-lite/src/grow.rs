@@ -44,11 +44,15 @@ pub enum PartSpec {
 pub struct GrowPolicy {
     pub enabled: bool,
     pub part: PartSpec,
+    /// 多 LV 时唯一受益 LV 的声明（grow.conf `lv=`）。单 LV 布局无需声明：
+    /// 与 part= 同构的"声明式指定"——把"空闲给谁"从猜测变为填空。
+    /// thin pool 名也可声明（此时扩的是池数据区，lvm 语义即如此）
+    pub lv: Option<String>,
 }
 
 impl Default for GrowPolicy {
     fn default() -> Self {
-        Self { enabled: false, part: PartSpec::Auto }
+        Self { enabled: false, part: PartSpec::Auto, lv: None }
     }
 }
 
@@ -81,6 +85,10 @@ pub fn load_policy_from(path: &Path) -> GrowPolicy {
                     Ok(num) => policy.part = PartSpec::Number(num),
                     Err(_) => log_line(&format!("grow.conf: invalid part '{n}', fallback auto")),
                 },
+            },
+            "lv" => match v.trim() {
+                "" | "auto" => policy.lv = None,
+                name => policy.lv = Some(name.to_string()),
             },
             unknown => log_line(&format!("grow.conf: unknown key '{unknown}' ignored")),
         }
@@ -669,11 +677,17 @@ struct GrowCtx {
     disk: String,
     disk_name: String,
     start: Instant,
+    lv_declared: Option<String>,
 }
 
 impl GrowCtx {
-    fn new(disk: &str) -> Self {
-        Self { disk: disk.to_string(), disk_name: disk_name_of(disk), start: Instant::now() }
+    fn new(disk: &str, policy: &GrowPolicy) -> Self {
+        Self {
+            disk: disk.to_string(),
+            disk_name: disk_name_of(disk),
+            start: Instant::now(),
+            lv_declared: policy.lv.clone(),
+        }
     }
     fn log(&self, msg: &str) {
         log_line(msg);
@@ -968,9 +982,10 @@ fn resize_fs(ctx: &GrowCtx, fs: FsKind, target: &str) -> Result<(), String> {
     }
 }
 
-/// LVM 扩容链：pvresize（PV 吃下分区新增空间）→ VG/LV 发现（唯一 LV 策略，
-/// 避免启发式猜错目标）→ vgchange -ay（initramfs 无 udev 规则，dm 节点必须
-/// 显式激活才会出现）→ lvextend -l +100%FREE → 对 dm 设备 sniff 后递归 fs 扩容。
+/// LVM 扩容链：pvresize（PV 吃下分区新增空间）→ VG/LV 发现（单 LV 自动，
+/// 多 LV 需 grow.conf `lv=` 声明，避免启发式猜错目标）→ vgchange -ay（initramfs
+/// 无 udev 规则，dm 节点必须显式激活才会出现）→ lvextend -l +100%FREE →
+/// 对 dm 设备 sniff 后递归 fs 扩容。
 /// 递归深度有界：LV 上只可能是 ext/xfs/btrfs（再嵌套 LVM 的病态布局不支持）
 fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     let _ = Command::new("modprobe").arg("dm-mod").status();
@@ -997,7 +1012,10 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
         return Err("PV not in any volume group".into());
     }
 
-    // 3) VG 内 LV 清单：仅唯一 LV 自动扩（多 LV 目标选择是用户决策，不猜）
+    // 3) VG 内 LV 清单与受益者选择（与 part= 同构的声明式策略，不猜）：
+    //    单 LV → 自动；多 LV → 必须命中 grow.conf `lv=` 声明，否则拒绝。
+    //    默认 lvs 不加 -a，hidden 子卷（[tdata]/[tmeta]/_pmspare）不出现在
+    //    输出中（lvs(8)：internal LV 仅 -a 可见），等值匹配亦不会误选
     let Some((code, lvs_out)) = ctx.run_capture(&tool_path(LVM), &["lvs", "--noheadings", "-o", "lv_name", &vg]) else {
         return Err("lvm spawn failed".into());
     };
@@ -1006,10 +1024,19 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     }
     let lv_names: Vec<String> =
         lvs_out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-    if lv_names.len() != 1 {
-        return Err(format!("volume group {vg} has {} logical volumes (auto-grow requires exactly 1)", lv_names.len()));
-    }
-    let lv = &lv_names[0];
+    let lv = match &lv_names[..] {
+        [only] => only.clone(),
+        _ => match &ctx.lv_declared {
+            Some(declared) if lv_names.iter().any(|n| n == declared) => declared.clone(),
+            _ => {
+                return Err(format!(
+                    "volume group {vg} has {} logical volumes; declare one via grow.conf 'lv=<name>' (found: {})",
+                    lv_names.len(),
+                    lv_names.join(", ")
+                ))
+            }
+        },
+    };
     let lv_path = format!("/dev/{vg}/{lv}");
 
     // 4) 激活 VG：dm 设备节点由激活创建（无 udev 的 initramfs 必需步骤）
@@ -1055,11 +1082,11 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
 
 /// --grow 子进程入口：每步失败即写 result 退出，永不 panic，exit 0 恒成立
 pub fn run_grow(disk: &str) -> ! {
-    let ctx = GrowCtx::new(disk);
+    let policy = load_policy();
+    let ctx = GrowCtx::new(disk, &policy);
     ctx.log(&format!("grow start: {disk}"));
 
     write_phase("analyze");
-    let policy = load_policy();
     if !policy.enabled {
         // Disabled：内部态，UI 不显示任何 grow 行
         ctx.finish(Status::Disabled, "", "", 0, 0);
