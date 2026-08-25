@@ -84,6 +84,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             render_main(app, frame);
             render_progress_dialog(app, frame);
         }
+        Screen::Growing => {
+            render_main(app, frame);
+            render_growing_dialog(app, frame);
+        }
         Screen::WriteError => {
             render_main(app, frame);
             render_write_error_dialog(app, frame);
@@ -244,6 +248,11 @@ fn render_context_help(app: &App, frame: &mut Frame, area: Rect) {
             Span::from("Esc/a ").bold().yellow(),
             Span::from("Abort write"),
         ],
+        Screen::Growing => vec![
+            Span::from("Auto-expanding partition... ")
+                .style(Style::default().fg(Color::Cyan)),
+            Span::from("please wait").style(Style::default().fg(Color::DarkGray)),
+        ],
         Screen::WriteError => vec![
             Span::from("Enter/Esc ").bold().yellow(),
             Span::from("Return to disk list"),
@@ -375,6 +384,49 @@ fn render_progress_dialog(app: &App, frame: &mut Frame) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Growing dialog (post-dd auto-expand)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn render_growing_dialog(app: &App, frame: &mut Frame) {
+    let Some(g) = app.grow.as_ref() else { return };
+
+    let area = centered_rect(56, 10, frame.area());
+
+    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spinner = spinner_chars[g.spinner_index];
+
+    let title = format!(" {} Expanding /dev/{} ", spinner, g.disk_name);
+
+    let border_block = Block::default()
+        .title(title)
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::default())
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let inner = border_block.inner(area);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(border_block, area);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(format!("  {}", g.phase_text))
+            .style(Style::default().fg(Color::White)),
+        Line::from(""),
+        Line::from("  Filling the remaining disk space with the last partition.")
+            .style(Style::default().fg(Color::DarkGray)),
+        Line::from("  Filesystem checks on large disks may take minutes.")
+            .style(Style::default().fg(Color::DarkGray)),
+        Line::from(""),
+        Line::from("  Do NOT power off during this step.")
+            .style(Style::default().fg(Color::Yellow)),
+    ];
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Write error dialog
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -413,8 +465,80 @@ fn render_write_error_dialog(app: &App, frame: &mut Frame) {
 // Success / reboot screen
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Wrap text at word boundaries to fit the dialog width.
+fn wrap_words(s: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else if cur.chars().count() + word.chars().count() + 1 <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// One-line grow result for the Success screen; Partial additionally
+/// carries self-contained manual recovery commands (tmpfs data is lost
+/// on reboot, so the command must be visible before the user leaves).
+fn grow_result_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(o) = app.grow_outcome.as_ref() else {
+        return vec![];
+    };
+
+    let (color, label) = match o.status.as_str() {
+        "expanded" => (Color::Green, "Auto-expand"),
+        "skipped" => (Color::Yellow, "Auto-expand skipped"),
+        "partial" => (Color::Yellow, "Auto-expand partial"),
+        _ => (Color::Red, "Auto-expand failed"),
+    };
+
+    let mut lines = vec![];
+    let summary = match o.status.as_str() {
+        "expanded" => {
+            let size = if o.old_bytes > 0 {
+                format!("{} → {}", format_bytes(o.old_bytes), format_bytes(o.new_bytes))
+            } else {
+                format_bytes(o.new_bytes)
+            };
+            format!("last partition grown to {}", size)
+        }
+        _ => o.reason.clone(),
+    };
+    lines.push(
+        Line::from(format!(" {}: {} ", label, summary))
+            .style(Style::default().fg(color))
+            .centered(),
+    );
+
+    if !o.manual_cmd.is_empty() {
+        lines.push(
+            Line::from(" Manual recovery (run after reboot):")
+                .style(Style::default().fg(Color::Yellow))
+                .centered(),
+        );
+        for chunk in wrap_words(&o.manual_cmd, 48) {
+            lines.push(
+                Line::from(format!("   {chunk}"))
+                    .style(Style::default().fg(Color::Yellow)),
+            );
+        }
+    }
+    lines
+}
+
 fn render_success_screen(app: &App, frame: &mut Frame) {
-    let area = centered_rect(56, 14, frame.area());
+    let grow_lines = grow_result_lines(app);
+    let height = (14 + grow_lines.len() as u16).min(frame.area().height.saturating_sub(1));
+    let area = centered_rect(56, height, frame.area());
     let block = dialog_block(" Installation Successful ", app.theme.success);
 
     let reboot_btn = if app.success_action == SuccessAction::Reboot && !app.reboot_counting {
@@ -437,6 +561,14 @@ fn render_success_screen(app: &App, frame: &mut Frame) {
             .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
             .centered(),
         Line::from(""),
+    ];
+
+    if !grow_lines.is_empty() {
+        lines.extend(grow_lines);
+        lines.push(Line::from(""));
+    }
+
+    lines.extend(vec![
         Line::from("NOTICE BEFORE REBOOTING:")
             .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             .centered(),
@@ -446,7 +578,7 @@ fn render_success_screen(app: &App, frame: &mut Frame) {
         Line::from("  * Ensure media is removed to avoid boot loops.")
             .style(Style::default().fg(Color::White)),
         Line::from(""),
-    ];
+    ]);
 
     if app.reboot_counting {
         lines.push(

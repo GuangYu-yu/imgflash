@@ -166,6 +166,9 @@ cd ..
 | `INCLUDE_VIRT` | 虚拟化模块开关 | `1` |
 | `ENABLE_SECURE_BOOT` | Secure Boot 支持 | `0` |
 | `USE_TUI` | 安装器模式（1=TUI / 0=Shell） | `1` |
+| `GROW_ENABLED` | dd 后自动扩容末分区（构建期能力开关，1=工具打入 initramfs） | `1` |
+| `GROW_PART` | 指定扩容分区号（`auto`=自动取末分区；候选校验失败则跳过） | `auto` |
+| `GROW_TOOLS` | 打包哪些文件系统扩容工具（`ext4,xfs,ntfs` 子集；sfdisk/mkswap/partx 为核心依赖无条件打包） | `"ext4,xfs,ntfs"` |
 | `BOOT_TIMEOUT` | 启动菜单超时（秒） | `0` |
 | `KERNEL_PARAMS` | 内核启动参数 | `quiet` |
 | `SCAN_TIMEOUT` | 启动时扫描介质的超时秒数 | `10` |
@@ -206,6 +209,25 @@ cd ..
 为 TUI 模式独立编译 `busybox_MODPROBE` / `busybox_MOUNT` 静态 applet（musl 工具链），并提交到 `binaries/AMD64/` 与 `binaries/ARM64/`：
 - 留空版本号自动检测最新版
 - 指定版本号则使用手动值
+
+### 构建 grow 静态工具链
+
+工作流：[`.github/workflows/grow-tools.yml`](.github/workflows/grow-tools.yml)
+
+为自动扩容功能编译 musl 静态工具（sfdisk / mkswap / partx / e2fsck / resize2fs / xfs_growfs / ntfsresize），连同 `LICENSES.txt`（GPL 随附义务）提交到 `binaries/<ARCH>/grow/`：
+- 各上游版本号可手动指定，留空用默认
+- `GROW_ENABLED=1` 构建前必须先运行此工作流（缺失即构建失败）
+
+## 自动扩容（Auto-Grow）
+
+dd 写入成功后，安装器自动将目标盘的**最后一个分区**原地扩展到盘尾，并扩展其文件系统（ext4 / XFS / NTFS），填满"盘 > 镜像"产生的尾部空闲空间。失败或跳过仅降级为警告，永不阻塞重启。
+
+- **候选规则**：只扩末分区；若末分区是 swap，则先做"swap 手术"（删除 → 扩倒数第二分区 → 磁盘末尾重建 swap，UUID/PARTUUID/分区号全保留）
+- **跳过场景**：尾部空闲 < 1MiB、FAT/exFAT、Btrfs/LVM/LUKS（v1）、MBR 扩展/逻辑分区、无分区表（superfloppy 直接扩 fs）
+- **逃生门**：内核参数 `grow=off` 可在运行期强制禁用
+- **模板兼容**：工具在模板构建时由 `GROW_ENABLED`/`GROW_TOOLS` 一次定型；每次构建的运行策略（开关、分区号）经 ISO 根的 `grow.conf` 映射，不重建 initramfs
+
+安装结果屏会显示一行扩容状态（Expanded / Skipped / Partial / Failed）；Partial 状态附自包含的手动恢复命令（重启后 `/run` 数据即失）。
 
 ## 安装器运行时
 

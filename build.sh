@@ -274,6 +274,44 @@ if [[ "${USE_TUI}" == "1" ]]; then
     cp "${SCRIPT_DIR}/binaries/disktui-lite" "${INITRAMFS_DIR}/usr/bin/disktui-lite"
     chmod +x "${INITRAMFS_DIR}/usr/bin/disktui-lite"
     ln -s /usr/bin/disktui-lite "${INITRAMFS_DIR}/init"
+
+    # --- grow 工具打包（构建期兑现声明能力，缺失即 die，不用 || true 掩盖 packaging 错误） ---
+    if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
+        GROW_BIN_DIR="${SCRIPT_DIR}/binaries/${ARCH^^}/grow"
+        [[ -d "${GROW_BIN_DIR}" ]] || die "GROW_ENABLED=1 但缺少 ${GROW_BIN_DIR}，请先运行 grow-tools workflow"
+
+        # 精确条目匹配（不用 *ext4* 子串——会误配 ext4foo 之类）
+        grow_tool_enabled() {
+            tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq "$1"
+        }
+
+        cp "${GROW_BIN_DIR}/sfdisk"  "${INITRAMFS_DIR}/usr/bin/sfdisk"
+        cp "${GROW_BIN_DIR}/mkswap"  "${INITRAMFS_DIR}/usr/bin/mkswap"
+        cp "${GROW_BIN_DIR}/partx"   "${INITRAMFS_DIR}/usr/bin/partx"
+        if grow_tool_enabled ext4; then
+            cp "${GROW_BIN_DIR}/e2fsck"   "${INITRAMFS_DIR}/usr/bin/e2fsck"
+            cp "${GROW_BIN_DIR}/resize2fs" "${INITRAMFS_DIR}/usr/bin/resize2fs"
+        fi
+        if grow_tool_enabled xfs; then
+            cp "${GROW_BIN_DIR}/xfs_growfs" "${INITRAMFS_DIR}/usr/bin/xfs_growfs"
+            MOD_FILESYSTEM="${MOD_FILESYSTEM} xfs"   # XFS 是 v1 唯一需内核驱动的 fs（mount 所需）
+        fi
+        grow_tool_enabled ntfs && cp "${GROW_BIN_DIR}/ntfsresize" "${INITRAMFS_DIR}/usr/bin/ntfsresize"
+
+        for t in sfdisk mkswap partx; do
+            [[ -x "${INITRAMFS_DIR}/usr/bin/${t}" ]] || die "grow 基础工具 ${t} 打包失败"
+        done
+        if grow_tool_enabled ext4; then
+            for t in e2fsck resize2fs; do
+                [[ -x "${INITRAMFS_DIR}/usr/bin/${t}" ]] || die "GROW_TOOLS=ext4 但 ${t} 打包失败"
+            done
+        fi
+        if grow_tool_enabled xfs; then
+            [[ -x "${INITRAMFS_DIR}/usr/bin/xfs_growfs" ]] || die "GROW_TOOLS=xfs 但 xfs_growfs 打包失败"
+        fi
+        grow_tool_enabled ntfs && { [[ -x "${INITRAMFS_DIR}/usr/bin/ntfsresize" ]] \
+            || die "GROW_TOOLS=ntfs 但 ntfsresize 打包失败"; }
+    fi
 # else
 #     cp /bin/busybox "${INITRAMFS_DIR}/bin/busybox"
 #     chmod +x "${INITRAMFS_DIR}/bin/busybox"
@@ -372,6 +410,18 @@ mkdir -p "${ISO_DIR}/boot"
 mv "${VMLINUZ}" "${ISO_DIR}/boot/vmlinuz"
 mv "${BUILD_DIR}/initrd.img" "${ISO_DIR}/boot/initrd.img"
 mv "${BUILD_DIR}/image.squashfs" "${ISO_DIR}/image.squashfs"
+
+# --- grow 策略文件 + 许可证（ISO 根，与 image.squashfs 同级） ---
+if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
+    printf 'enabled=1\npart=%s\n' "${GROW_PART:-auto}" > "${ISO_DIR}/grow.conf"
+    [[ -f "${GROW_BIN_DIR}/LICENSES.txt" ]] || die "grow LICENSES.txt 缺失（应随 grow-tools workflow 生成，GPL 随附义务见方案 B 节）"
+    cp "${GROW_BIN_DIR}/LICENSES.txt" "${ISO_DIR}/grow-licenses.txt"
+    # 粗粒度 fail-fast：覆盖值必须真实存在（sfdisk 对镜像文件可用）
+    if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then
+        sfdisk -d "${IMAGE_SRC}" 2>/dev/null | grep -q "image.img${GROW_PART} :" \
+            || die "GROW_PART=${GROW_PART} 在镜像中不存在"
+    fi
+fi
 
 # --- BIOS 引导（syslinux，仅 amd64） ---
 if [[ "${HAS_BIOS}" -eq 1 ]]; then

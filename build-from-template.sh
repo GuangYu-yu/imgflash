@@ -227,9 +227,21 @@ echo "  Phase 1 完成。"
 # =============================================================================
 echo ""; echo "[Phase 2] 从模板构建 ISO ..."
 
+# grow.conf 每次构建可变（运行策略）——映射进 ISO 根；initramfs 能力已由模板定型
+GROW_MAP_ARGS=()
+if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
+    printf 'enabled=1\npart=%s\n' "${GROW_PART:-auto}" > "${BUILD_DIR}/grow.conf"
+    GROW_MAP_ARGS=(-map "${BUILD_DIR}/grow.conf" /grow.conf)
+    if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then
+        sfdisk -d "${IMAGE_PATH}" 2>/dev/null | grep -q "image.img${GROW_PART} :" \
+            || die "GROW_PART=${GROW_PART} 在镜像中不存在"
+    fi
+fi
+
 xorriso -indev "${TEMPLATE_PATH}" \
     -outdev "${FINAL_ISO}" \
     -map "${BUILD_DIR}/image.squashfs" /image.squashfs \
+    "${GROW_MAP_ARGS[@]}" \
     -volid "${VOLUME_LABEL}" \
     -boot_image any replay \
     -commit
