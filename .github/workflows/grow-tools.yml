@@ -10,7 +10,7 @@ on:
         description: 'e2fsprogs 版本（示例 1.47.4）'
         required: true
       xfsprogs_version:
-        description: 'xfsprogs 版本（示例 6.19.0）'
+        description: 'xfsprogs 版本（示例 7.1.1）'
         required: true
       ntfs3g_version:
         description: 'ntfs-3g 版本（示例 2026.7.7）'
