@@ -182,6 +182,7 @@ jobs:
             -v "$(pwd)/build:/build/build" \
             -v "$(pwd)/output:/build/output" \
             -v "$(pwd)/templates:/build/templates" \
+            -v "$(pwd)/binaries:/build/binaries" \
             -v "$(pwd)/build.env:/build/build.env" \
             -e ARCH="${ARCH}" \
             -e ENABLE_SECURE_BOOT="${ENABLE_SECURE_BOOT}" \
