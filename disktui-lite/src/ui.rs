@@ -7,7 +7,11 @@ use ratatui::{
 };
 
 use crate::app::{App, ConfirmButton, Screen, SuccessAction};
+use crate::grow::Status;
 use crate::utils::format_bytes;
+
+/// 写入/扩容进度屏共用的 spinner 帧（10 帧，与 app.tick 的 % 10 取模对应）
+const SPINNER_CHARS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Center a popup of given width/height within the terminal area.
 fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
@@ -329,8 +333,7 @@ fn render_progress_dialog(app: &App, frame: &mut Frame) {
 
     let area = centered_rect(64, 12, frame.area());
 
-    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let spinner = spinner_chars[progress.spinner_index];
+    let spinner = SPINNER_CHARS[progress.spinner_index];
 
     let title = format!(
         " {} Writing to /dev/{} ({}) ",
@@ -392,8 +395,7 @@ fn render_growing_dialog(app: &App, frame: &mut Frame) {
 
     let area = centered_rect(56, 10, frame.area());
 
-    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let spinner = spinner_chars[g.spinner_index];
+    let spinner = SPINNER_CHARS[g.spinner_index];
 
     let title = format!(" {} Expanding /dev/{} ", spinner, g.disk_name);
 
@@ -494,16 +496,16 @@ fn grow_result_lines(app: &App) -> Vec<Line<'static>> {
         return vec![];
     };
 
-    let (color, label) = match o.status.as_str() {
-        "expanded" => (Color::Green, "Auto-expand"),
-        "skipped" => (Color::Yellow, "Auto-expand skipped"),
-        "partial" => (Color::Yellow, "Auto-expand partial"),
-        _ => (Color::Red, "Auto-expand failed"),
+    let (color, label) = match o.status {
+        Status::Expanded => (Color::Green, "Auto-expand"),
+        Status::Skipped => (Color::Yellow, "Auto-expand skipped"),
+        Status::Partial => (Color::Yellow, "Auto-expand partial"),
+        Status::Failed | Status::Disabled => (Color::Red, "Auto-expand failed"),
     };
 
     let mut lines = vec![];
-    let summary = match o.status.as_str() {
-        "expanded" => {
+    let summary = match o.status {
+        Status::Expanded => {
             let size = if o.old_bytes > 0 {
                 format!("{} → {}", format_bytes(o.old_bytes), format_bytes(o.new_bytes))
             } else {

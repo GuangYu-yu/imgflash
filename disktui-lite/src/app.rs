@@ -189,21 +189,18 @@ pub struct GrowProgress {
     pub(crate) phase_text: String,
     pub(crate) spinner_index: usize,
     grow_child: Option<Child>,
-    started: Instant,
     last_change: Instant,
     last_mtime: Option<SystemTime>,
 }
 
 impl GrowProgress {
     pub fn new(disk_name: &str, child: Child) -> Self {
-        let now = Instant::now();
         Self {
             disk_name: disk_name.to_string(),
             phase_text: "Analyzing disk layout".to_string(),
             spinner_index: 0,
             grow_child: Some(child),
-            started: now,
-            last_change: now,
+            last_change: Instant::now(),
             last_mtime: None,
         }
     }
@@ -235,10 +232,6 @@ impl GrowProgress {
             true
         }
     }
-
-    pub fn elapsed_secs(&self) -> u64 {
-        self.started.elapsed().as_secs()
-    }
 }
 
 // ── Main App ────────────────────────────────────────────────────────────
@@ -267,6 +260,8 @@ pub struct App {
 impl App {
     pub const IMAGE_FILE: &'static str = "/image/image.img";
     const REBOOT_SECONDS: u8 = 5;
+    /// TUI 主循环 tick 间隔（100ms）——main 轮询与进度速度换算的单一来源
+    pub const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
     pub fn new() -> AppResult<Self> {
         let disks = DiskInfo::enumerate()?;

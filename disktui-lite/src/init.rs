@@ -45,6 +45,8 @@ pub fn emergency_halt(msg: &str) -> ! {
 // ── Phase 1: Bootstrap ─────────────────────────────────────────────────
 
 fn setup_path() -> anyhow::Result<()> {
+    // SAFETY: init 阶段单线程执行（尚无其他线程），set_var 不存在与其他线程
+    // 并发读写环境变量的竞态；且仅写入 PATH 一处，不读取可变环境项。
     unsafe {
         std::env::set_var("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     }

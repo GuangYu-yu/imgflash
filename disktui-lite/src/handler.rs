@@ -1,7 +1,7 @@
 use anyhow::Context;
 
 use crate::app::{App, ConfirmButton, GrowProgress, Screen, SuccessAction, WriteProgress};
-use crate::grow::{self, GrowOutcome};
+use crate::grow::{self, GrowOutcome, Status};
 
 pub fn handle_key_events(key: crossterm::event::KeyEvent, app: &mut App) -> anyhow::Result<()> {
     // Help overlay: any key dismisses
@@ -244,7 +244,7 @@ pub fn poll_dd_progress(app: &mut App) {
     }
 
     let (process_status, written) = progress.check_and_read_io();
-    progress.update_progress(written, 0.1);
+    progress.update_progress(written, App::TICK_INTERVAL.as_secs_f64());
 
     match process_status {
         Some(true) => {
@@ -290,7 +290,7 @@ fn start_grow(app: &mut App) {
         Err(_) => {
             // Spawn failure = infrastructure fault: record Failed and move on
             app.grow_outcome = Some(GrowOutcome {
-                status: "failed".to_string(),
+                status: Status::Failed,
                 device: format!("/dev/{}", disk_name),
                 reason: "failed to spawn grow process".to_string(),
                 ..GrowOutcome::default()
@@ -323,7 +323,7 @@ pub fn poll_grow_progress(app: &mut App) {
         // Child exited: result must exist (atomic write precedes exit);
         // missing result = crash → synthesize Failed
         grow::read_result().unwrap_or_else(|| GrowOutcome {
-            status: "failed".to_string(),
+            status: Status::Failed,
             device: format!("/dev/{}", disk_name),
             reason: "grow process exited without result".to_string(),
             ..GrowOutcome::default()
@@ -334,7 +334,7 @@ pub fn poll_grow_progress(app: &mut App) {
         // create the torn partition-table window; reboot carries the same
         // accepted risk.
         GrowOutcome {
-            status: "failed".to_string(),
+            status: Status::Failed,
             device: format!("/dev/{}", disk_name),
             reason: "grow timed out (no progress)".to_string(),
             ..GrowOutcome::default()
@@ -342,6 +342,6 @@ pub fn poll_grow_progress(app: &mut App) {
     };
 
     // Disabled is internal: no grow line on the Success screen
-    app.grow_outcome = (outcome.status != "disabled").then_some(outcome);
+    app.grow_outcome = (outcome.status != Status::Disabled).then_some(outcome);
     app.goto_success();
 }

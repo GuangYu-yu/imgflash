@@ -1,3 +1,6 @@
+/// 磁盘逻辑扇区字节数（512B）——单一来源，disk/grow 共用
+pub const SECTOR: u64 = 512;
+
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: &[(u64, &str)] = &[
         (1_000_000_000_000, "TB"),

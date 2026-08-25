@@ -1,5 +1,4 @@
 use std::io::{self, Write};
-use std::time::Duration;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -111,8 +110,8 @@ fn main() -> AppResult<()> {
         // Poll post-dd grow progress
         poll_grow_progress(&mut app);
 
-        // Handle input (100ms timeout = tick rate)
-        if crossterm::event::poll(Duration::from_millis(100))?
+        // Handle input (tick 间隔轮询)
+        if crossterm::event::poll(App::TICK_INTERVAL)?
             && let crossterm::event::Event::Key(key) = crossterm::event::read()?
             && key.kind == crossterm::event::KeyEventKind::Press
         {

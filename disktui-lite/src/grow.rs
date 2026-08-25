@@ -17,6 +17,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::utils::SECTOR;
+
 #[cfg(target_os = "linux")]
 use crate::init::BOOT_MEDIA_DIR;
 #[cfg(not(target_os = "linux"))]
@@ -27,7 +29,6 @@ pub const STATUS_FILE: &str = "/run/grow.status";
 pub const RESULT_FILE: &str = "/run/grow.result";
 pub const LOG_FILE: &str = "/run/grow.log";
 const GROW_MNT: &str = "/tmp/.growmnt";
-const SECTOR: u64 = 512;
 /// NoUsefulSpace 阈值：尾部空闲 < 1MiB 视为无可扩空间
 const MIN_FREE_SECTORS: u64 = 2048;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -451,16 +452,6 @@ fn disk_name_of(disk_dev: &str) -> String {
     disk_dev.rsplit('/').next().unwrap_or(disk_dev).to_string()
 }
 
-/// analyze 入口：读 /sys 设备尺寸后委托 analyze_with
-pub fn analyze(disk_dev: &str, policy: &GrowPolicy) -> GrowPlan {
-    let name = disk_name_of(disk_dev);
-    let device_sectors = read_sys_block_size(&name).unwrap_or(0);
-    if device_sectors == 0 {
-        return GrowPlan { action: None, skip_reason: Some("cannot read device size".into()) };
-    }
-    analyze_with(Path::new(disk_dev), &name, device_sectors, policy)
-}
-
 pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &GrowPolicy) -> GrowPlan {
     let skip = |r: &str| GrowPlan { action: None, skip_reason: Some(r.to_string()) };
     let Ok(mut f) = File::open(dev) else {
@@ -588,12 +579,13 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, policy: &G
 
 // ── 执行层（--grow 子进程） ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Status {
     Disabled,
     Expanded,
     Skipped,
     Partial,
+    #[default]
     Failed,
 }
 
@@ -609,18 +601,26 @@ impl Status {
     }
 }
 
-// 工具路径（存在性守卫与 spawn 用同一来源）。工具不进 initramfs，随 fast path
-// 注入 ISO 根 /grow/；挂载仅 MS_RDONLY 不含 noexec，静态 musl 二进制可直接执行
-const SFDISK: &str = "/media/cdrom/grow/sfdisk";
-const MKSWAP: &str = "/media/cdrom/grow/mkswap";
-const PARTX: &str = "/media/cdrom/grow/partx";
-const E2FSCK: &str = "/media/cdrom/grow/e2fsck";
-const RESIZE2FS: &str = "/media/cdrom/grow/resize2fs";
-const XFS_GROWFS: &str = "/media/cdrom/grow/xfs_growfs";
-const NTFSRESIZE: &str = "/media/cdrom/grow/ntfsresize";
-const BTRFS: &str = "/media/cdrom/grow/btrfs";
+// 工具名（存在性守卫与 spawn 用同一来源）。工具不进 initramfs，随 fast path
+// 注入 ISO 根 /grow/；挂载仅 MS_RDONLY 不含 noexec，静态 musl 二进制可直接执行。
+// 绝对路径由 tool_path() 从 BOOT_MEDIA_DIR 拼接（避免介质路径前缀二次硬编码）
+const SFDISK: &str = "sfdisk";
+const MKSWAP: &str = "mkswap";
+const PARTX: &str = "partx";
+const E2FSCK: &str = "e2fsck";
+const RESIZE2FS: &str = "resize2fs";
+const XFS_GROWFS: &str = "xfs_growfs";
+const NTFSRESIZE: &str = "ntfsresize";
+const BTRFS: &str = "btrfs";
 /// LVM2 多调用二进制：统一以 `lvm <子命令>` 形式调用（pvresize/lvs/vgchange/lvextend）
-const LVM: &str = "/media/cdrom/grow/lvm";
+const LVM: &str = "lvm";
+/// 工具子目录（相对安装介质根）
+const GROW_TOOLS_DIR: &str = "grow";
+
+/// 工具绝对路径（BOOT_MEDIA_DIR 拼接，与 grow.conf 同源）
+fn tool_path(name: &str) -> String {
+    format!("{BOOT_MEDIA_DIR}/{GROW_TOOLS_DIR}/{name}")
+}
 
 /// 原子写（write-to-tmp + rename，同 /run tmpfs 内 rename 原子），
 /// 杜绝 TUI 读到 truncate 后的空帧/半帧
@@ -736,6 +736,27 @@ impl GrowCtx {
         }
         Some((code, so))
     }
+
+    /// 工具执行并归因：exit 0 返回继续；失败/无法 spawn 由闭包归因并终结
+    /// （闭包内调用 ctx.finish 发散，其后代码不可达）。返回 ()，成功继续。
+    fn run_checked(
+        &self,
+        tool: &str,
+        args: &[&str],
+        stdin: Option<&str>,
+        on_fail: impl FnOnce(i32),
+        on_spawn: impl FnOnce(),
+    ) {
+        match self.run(tool, args, stdin) {
+            Some(0) => {}
+            Some(c) => {
+                on_fail(c);
+            }
+            None => {
+                on_spawn();
+            }
+        }
+    }
 }
 
 fn read_sys_block_size(disk_name: &str) -> Option<u64> {
@@ -762,7 +783,7 @@ fn wait_partition_visible(ctx: &GrowCtx, part_num: u32, min_size: u64) -> bool {
     let node_missing = sysfs_part_size(&ctx.disk_name, part_num).is_none();
     let mode = if node_missing { "-a" } else { "-u" };
     ctx.log(&format!("kernel reread incomplete, trying partx {mode}"));
-    let _ = ctx.run(PARTX, &[mode, &ctx.disk], None);
+    let _ = ctx.run(&tool_path(PARTX), &[mode, &ctx.disk], None);
     for _ in 0..POLL_TRIES {
         if check(min_size) {
             return true;
@@ -794,13 +815,20 @@ fn backup_header_at_end(disk: &str, device_sectors: u64) -> bool {
         && le64(&tail[24..32]) == device_sectors.saturating_sub(1)
 }
 
+/// 工具存在性检查集合：手术路径额外需要 sfdisk/mkswap/partx
+#[derive(Clone, Copy)]
+enum ToolNeed {
+    Plain,
+    Surgery,
+}
+
 /// 工具存在性守卫（模板 initramfs 与 grow.conf 不匹配时的安全网）。
 /// 返回 None = 齐备；Some(reason) = Skipped 原因
-fn tools_missing(fs: FsKind, need_surgery: bool) -> Option<String> {
+fn tools_missing(fs: FsKind, need: ToolNeed) -> Option<String> {
     let mut missing: Vec<&str> = vec![];
-    if need_surgery {
+    if matches!(need, ToolNeed::Surgery) {
         for t in [SFDISK, MKSWAP, PARTX] {
-            if !Path::new(t).exists() {
+            if !Path::new(&tool_path(t)).exists() {
                 missing.push(t);
             }
         }
@@ -814,63 +842,104 @@ fn tools_missing(fs: FsKind, need_surgery: bool) -> Option<String> {
         _ => &[],
     };
     for t in fs_tools {
-        if !Path::new(t).exists() {
+        if !Path::new(&tool_path(t)).exists() {
             missing.push(t);
         }
     }
     (!missing.is_empty()).then(|| format!("tools not bundled: {}", missing.join(", ")))
 }
 
+/// 在线扩容 fs 规格：挂载参数、工具命令与归因文案（单一数据，供 grow_mounted_fs 消费）。
+/// 非 Linux 构建仅占位（Linux-only 项目），字段只被 linux 分支读取
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct MountedGrow {
+    fstype: &'static str,
+    module: &'static str,
+    display_name: &'static str,
+    tool: &'static str,
+    args: &'static [&'static str],
+    mount_err: &'static str,
+    grow_err: &'static str,
+}
+
+const XFS_GROW: MountedGrow = MountedGrow {
+    fstype: "xfs",
+    module: "xfs",
+    display_name: "XFS",
+    tool: XFS_GROWFS,
+    args: &["-d", GROW_MNT],
+    mount_err: "XFS kernel support unavailable",
+    grow_err: "xfs_growfs failed",
+};
+
+const BTRFS_GROW: MountedGrow = MountedGrow {
+    fstype: "btrfs",
+    module: "btrfs",
+    display_name: "Btrfs",
+    tool: BTRFS,
+    args: &["filesystem", "resize", "max", GROW_MNT],
+    mount_err: "Btrfs kernel support unavailable",
+    grow_err: "btrfs filesystem resize failed",
+};
+
+/// 在线扩容共享路径：modprobe 防御 → 挂载 → 工具执行 → 卸载。
+/// spec 携带 fstype/module/工具命令与归因文案；mount 失败即 Err（fs 支持缺失）。
+fn grow_mounted_fs(ctx: &GrowCtx, target: &str, spec: &MountedGrow) -> Result<(), String> {
+    // 防御纵深：boot 期模块列表通常已加载 fstype，此处不依赖该隐式前提；
+    // 不检查返回值，mount 失败自然兜底归因
+    let _ = Command::new("modprobe").arg(spec.module).status();
+    let _ = fs::create_dir_all(GROW_MNT);
+    #[cfg(target_os = "linux")]
+    {
+        use nix::mount::{MsFlags, mount, umount};
+        // 显式 turbofish：data=None 单独无法推断类型（与 init.rs 同模式）
+        if mount::<str, str, str, str>(Some(target), GROW_MNT, Some(spec.fstype), MsFlags::empty(), None).is_err() {
+            return Err(spec.mount_err.into());
+        }
+        let grown = matches!(ctx.run(&tool_path(spec.tool), spec.args, None), Some(0));
+        let _ = umount(GROW_MNT);
+        if grown {
+            return Ok(());
+        }
+        Err(spec.grow_err.into())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Linux-only 项目：非 linux 路径仅为占位，显式丢弃其余参数
+        let _ = (ctx, target);
+        Err(format!("{} grow requires Linux", spec.display_name))
+    }
+}
+
 /// fs 扩容分发。Err(reason) = 工具拒绝或执行失败（归因由调用方按 mutation 状态定级）
 fn resize_fs(ctx: &GrowCtx, fs: FsKind, target: &str) -> Result<(), String> {
     match fs {
         FsKind::Ext => {
-            let Some(code) = ctx.run(E2FSCK, &["-fp", target], None) else {
+            let Some(code) = ctx.run(&tool_path(E2FSCK), &["-fp", target], None) else {
                 return Err("e2fsck spawn failed".into());
             };
             // 显式白名单 0..=2，禁止 4+——防未来退出码扩展自动放行
             if !matches!(code, 0..=2) {
                 return Err(format!("e2fsck rejected (exit {code}, filesystem inconsistent)"));
             }
-            match ctx.run(RESIZE2FS, &[target], None) {
+            match ctx.run(&tool_path(RESIZE2FS), &[target], None) {
                 Some(0) => Ok(()),
                 Some(c) => Err(format!("resize2fs failed (exit {c})")),
                 None => Err("resize2fs spawn failed".into()),
             }
         }
-        FsKind::Xfs => {
-            // 防御纵深：boot 期模块列表通常已加载 xfs，此处不依赖该隐式前提；
-            // 不检查返回值，mount 失败自然兜底归因
-            let _ = Command::new("modprobe").arg("xfs").status();
-            let _ = fs::create_dir_all(GROW_MNT);
-            #[cfg(target_os = "linux")]
-            {
-                use nix::mount::{MsFlags, mount, umount};
-                // 显式 turbofish：data=None 单独无法推断类型（与 init.rs 同模式）
-                if mount::<str, str, str, str>(Some(target), GROW_MNT, Some("xfs"), MsFlags::empty(), None).is_err() {
-                    return Err("XFS kernel support unavailable".into());
-                }
-                let grown = matches!(ctx.run(XFS_GROWFS, &["-d", GROW_MNT], None), Some(0));
-                let _ = umount(GROW_MNT);
-                if grown {
-                    return Ok(());
-                }
-                return Err("xfs_growfs failed".into());
-            }
-            #[cfg(not(target_os = "linux"))]
-            Err("XFS grow requires Linux".into())
-        }
+        FsKind::Xfs => grow_mounted_fs(ctx, target, &XFS_GROW),
         FsKind::Ntfs => {
             // 干跑守卫：休眠/Fast Startup/BitLocker 脏卷在此拒绝
             let dry_t = ctx.elapsed();
-            match ctx.run(NTFSRESIZE, &["-n", "-P", target], None) {
+            match ctx.run(&tool_path(NTFSRESIZE), &["-n", "-P", target], None) {
                 Some(0) => {}
                 Some(c) => return Err(format!("ntfsresize dry-run rejected (exit {c}, volume dirty or hibernated)")),
                 None => return Err("ntfsresize spawn failed".into()),
             }
             ctx.log(&format!("ntfsresize dry-run ok at t={}s", dry_t));
             // 实跑 -ff：纯 flag 零交互（Clonezilla batch 实证用法），安全性由前置干跑保证
-            match ctx.run(NTFSRESIZE, &["-ff", "-P", target], None) {
+            match ctx.run(&tool_path(NTFSRESIZE), &["-ff", "-P", target], None) {
                 Some(0) => {
                     ctx.log(&format!("ntfsresize real-run done at t={}s", ctx.elapsed()));
                     Ok(())
@@ -879,28 +948,7 @@ fn resize_fs(ctx: &GrowCtx, fs: FsKind, target: &str) -> Result<(), String> {
                 None => Err("ntfsresize spawn failed".into()),
             }
         }
-        FsKind::Btrfs => {
-            // 在线扩容：btrfs filesystem resize max <挂载点>（官方 man 核实；
-            // 单设备由分析层 num_devices==1 保证，多设备已提前 skip）
-            let _ = Command::new("modprobe").arg("btrfs").status();
-            let _ = fs::create_dir_all(GROW_MNT);
-            #[cfg(target_os = "linux")]
-            {
-                use nix::mount::{MsFlags, mount, umount};
-                // 显式 turbofish：data=None 单独无法推断类型（与 init.rs 同模式）
-                if mount::<str, str, str, str>(Some(target), GROW_MNT, Some("btrfs"), MsFlags::empty(), None).is_err() {
-                    return Err("Btrfs kernel support unavailable".into());
-                }
-                let grown = matches!(ctx.run(BTRFS, &["filesystem", "resize", "max", GROW_MNT], None), Some(0));
-                let _ = umount(GROW_MNT);
-                if grown {
-                    return Ok(());
-                }
-                return Err("btrfs filesystem resize failed".into());
-            }
-            #[cfg(not(target_os = "linux"))]
-            Err("Btrfs grow requires Linux".into())
-        }
+        FsKind::Btrfs => grow_mounted_fs(ctx, target, &BTRFS_GROW),
         FsKind::Lvm => resize_lvm(ctx, target),
         _ => Err("unsupported filesystem".into()),
     }
@@ -917,7 +965,7 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     let _ = fs::create_dir_all("/run/lock/lvm");
 
     // 1) PV 扩容（分区已由调用方扩完）
-    match ctx.run(LVM, &["pvresize", target], None) {
+    match ctx.run(&tool_path(LVM), &["pvresize", target], None) {
         Some(0) => {}
         Some(c) => return Err(format!("pvresize failed (exit {c})")),
         None => return Err("lvm spawn failed".into()),
@@ -951,14 +999,14 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     let lv_path = format!("/dev/{vg}/{lv}");
 
     // 4) 激活 VG：dm 设备节点由激活创建（无 udev 的 initramfs 必需步骤）
-    match ctx.run(LVM, &["vgchange", "-ay", &vg], None) {
+    match ctx.run(&tool_path(LVM), &["vgchange", "-ay", &vg], None) {
         Some(0) => {}
         Some(c) => return Err(format!("vgchange -ay failed (exit {c})")),
         None => return Err("lvm spawn failed".into()),
     }
 
     // 5) LV 吃掉 VG 全部空闲 extent
-    match ctx.run(LVM, &["lvextend", "-l", "+100%FREE", &lv_path], None) {
+    match ctx.run(&tool_path(LVM), &["lvextend", "-l", "+100%FREE", &lv_path], None) {
         Some(0) => {}
         Some(c) => return Err(format!("lvextend failed (exit {c})")),
         None => return Err("lvm spawn failed".into()),
@@ -985,7 +1033,7 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     if !matches!(lv_fs, FsKind::Ext | FsKind::Xfs | FsKind::Btrfs) {
         return Err(format!("LV filesystem not growable ({lv_fs:?})"));
     }
-    if let Some(reason) = tools_missing(lv_fs, false) {
+    if let Some(reason) = tools_missing(lv_fs, ToolNeed::Plain) {
         return Err(format!("{reason} (LV {dm})"));
     }
     resize_fs(ctx, lv_fs, &dm)
@@ -1015,7 +1063,7 @@ pub fn run_grow(disk: &str) -> ! {
 
     match action {
         GrowAction::FilesystemOnly { fs, fs_dev } => {
-            if let Some(reason) = tools_missing(fs, false) {
+            if let Some(reason) = tools_missing(fs, ToolNeed::Plain) {
                 ctx.finish(Status::Skipped, &reason, "", 0, 0);
             }
             write_phase("filesystem");
@@ -1029,14 +1077,14 @@ pub fn run_grow(disk: &str) -> ! {
             }
         }
         GrowAction::PartitionGrow { part_num, part_dev, fs, surgery, expected_new_sectors, old_sectors, is_gpt } => {
-            if let Some(reason) = tools_missing(fs, true) {
+            if let Some(reason) = tools_missing(fs, ToolNeed::Surgery) {
                 ctx.finish(Status::Skipped, &reason, "", 0, 0);
             }
             write_phase("partition");
 
             // GPT：relocate backup header 到设备末端（仅 GPT；MBR 跳过）
             if is_gpt {
-                match ctx.run(SFDISK, &["--relocate", "gpt-bak-std", &ctx.disk], None) {
+                match ctx.run(&tool_path(SFDISK), &["--relocate", "gpt-bak-std", &ctx.disk], None) {
                     Some(0) => {}
                     _ => {
                         // relocate 失败归因（它是 GPT metadata 写操作，纳入"持久变更"原则）：
@@ -1063,26 +1111,28 @@ pub fn run_grow(disk: &str) -> ! {
                 // 非手术：`, +`（start/type/UUID 全保留）。前置不变量：分析层已证明
                 // target 是 end-LBA 最大可扩分区且其后无障碍——安全边界全在分析层
                 let stdin = ", +\n";
-                match ctx.run(SFDISK, &["-N", &part_num.to_string(), &ctx.disk], Some(stdin)) {
-                    Some(0) => {}
-                    Some(c) => {
+                ctx.run_checked(
+                    &tool_path(SFDISK),
+                    &["-N", &part_num.to_string(), &ctx.disk],
+                    Some(stdin),
+                    |c| {
                         // GPT relocate 已提交 mutation → 不得降级 Skipped；MBR 未变更 → Skipped
                         let reason = format!("sfdisk partition grow failed (exit {c})");
                         if is_gpt {
                             ctx.finish(Status::Partial, &reason, "", old_sectors * SECTOR, 0);
+                        } else {
+                            ctx.finish(Status::Skipped, &reason, "", 0, 0);
                         }
-                        ctx.finish(Status::Skipped, &reason, "", 0, 0);
-                    }
-                    None => ctx.finish(Status::Failed, "sfdisk spawn failed", "", 0, 0),
-                }
+                    },
+                    || ctx.finish(Status::Failed, "sfdisk spawn failed", "", 0, 0),
+                );
 
                 write_phase("kernel-reread");
                 // /sys 比对消费分析层的 expected 值；扣 `, +` 对齐容差（<1MiB，man 已核实）
                 let expected = expected_new_sectors.unwrap_or(0);
                 let min_size = expected.saturating_sub(MIN_FREE_SECTORS);
-                if old_sectors >= min_size {
-                    // 期望值未超过旧尺寸（对齐后无增长空间）→ 已是目标态
-                } else if !wait_partition_visible(&ctx, part_num, min_size) {
+                // 期望值未超过旧尺寸（对齐后无增长空间）→ 已是目标态，无需等待内核同步
+                if old_sectors < min_size && !wait_partition_visible(&ctx, part_num, min_size) {
                     // 与手术路径同档归档：分区表已持久扩容（sfdisk exit 0 已过），
                     // 卡点在内核同步 → Failed + fs 手动命令（重启后内核重读即扩，补 fs 即完成）
                     let manual = manual_cmd_for_fs(fs, &part_dev);
@@ -1178,55 +1228,70 @@ fn grow_with_surgery(
     let manual_s4 = manual_cmd_for_fs(fs, root_dev);
 
     // S0 → S1：删除 swap（失败 = 未动盘 → Skipped）
-    match ctx.run(SFDISK, &["--delete", &ctx.disk, &s.swap_num.to_string()], None) {
-        Some(0) => {}
-        Some(c) => ctx.finish(Status::Skipped, &format!("swap delete failed (exit {c})"), "", 0, 0),
-        None => ctx.finish(Status::Failed, "sfdisk spawn failed", "", 0, 0),
-    }
+    ctx.run_checked(
+        &tool_path(SFDISK),
+        &["--delete", &ctx.disk, &s.swap_num.to_string()],
+        None,
+        |c| ctx.finish(Status::Skipped, &format!("swap delete failed (exit {c})"), "", 0, 0),
+        || ctx.finish(Status::Failed, "sfdisk spawn failed", "", 0, 0),
+    );
     ctx.log("surgery S1: swap deleted");
 
     // S1 → S2：root 精确扇区扩容（start/type/UUID 保留，size 精确无对齐优化）
     let stdin = format!(", {root_new_size}, type={}\n", s.root_ptype);
-    match ctx.run(SFDISK, &["-N", &s.root_num.to_string(), &ctx.disk], Some(&stdin)) {
-        Some(0) => {}
-        Some(c) => ctx.finish(
+    ctx.run_checked(
+        &tool_path(SFDISK),
+        &["-N", &s.root_num.to_string(), &ctx.disk],
+        Some(&stdin),
+        |c| ctx.finish(
             Status::Partial,
             &format!("swap deleted; target unchanged (root expand exit {c})"),
             &manual_s2,
             0,
             0,
         ),
-        None => ctx.finish(Status::Failed, "sfdisk spawn failed", &manual_s2, 0, 0),
-    }
+        || ctx.finish(Status::Failed, "sfdisk spawn failed", &manual_s2, 0, 0),
+    );
     ctx.log("surgery S2: target expanded");
 
     // S2 → S3：swap 尾部重建（复用原槽位 → 分区号/fstab 引用保真）
     let stdin = format!("{}, {}, type={}\n", new_swap_start, s.swap_sectors, s.swap_ptype);
-    match ctx.run(SFDISK, &["-N", &s.swap_num.to_string(), &ctx.disk], Some(&stdin)) {
-        Some(0) => {}
-        Some(c) => ctx.finish(
+    ctx.run_checked(
+        &tool_path(SFDISK),
+        &["-N", &s.swap_num.to_string(), &ctx.disk],
+        Some(&stdin),
+        |c| ctx.finish(
             Status::Partial,
             &format!("target expanded; swap missing (recreate exit {c})"),
             &manual_s3,
             old_root_sectors * SECTOR,
             0,
         ),
-        None => ctx.finish(Status::Failed, "sfdisk spawn failed", &manual_s3, old_root_sectors * SECTOR, 0),
-    }
+        || ctx.finish(Status::Failed, "sfdisk spawn failed", &manual_s3, old_root_sectors * SECTOR, 0),
+    );
     ctx.log("surgery S3: swap partition rebuilt");
 
     // PARTUUID 恢复（仅 GPT；两命名空间独立，不抽象为单一 restore）
     if let Some(pu) = &s.swap_partuuid {
-        match ctx.run(SFDISK, &["--part-uuid", &ctx.disk, &s.swap_num.to_string(), pu], None) {
-            Some(0) => {}
-            _ => ctx.finish(
+        ctx.run_checked(
+            &tool_path(SFDISK),
+            &["--part-uuid", &ctx.disk, &s.swap_num.to_string(), pu],
+            None,
+            |_| ctx.finish(
                 Status::Partial,
                 "target expanded; swap recreation incomplete (part-uuid restore failed)",
                 &manual_s3,
                 old_root_sectors * SECTOR,
                 0,
             ),
-        }
+            || ctx.finish(
+                Status::Partial,
+                "target expanded; swap recreation incomplete (part-uuid restore failed)",
+                &manual_s3,
+                old_root_sectors * SECTOR,
+                0,
+            ),
+        );
     }
 
     // 内核同步最终判据：/sys 实际尺寸（root 精确值 + swap 精确值）
@@ -1247,17 +1312,19 @@ fn grow_with_surgery(
     mkswap_args.extend(label_arg);
     mkswap_args.push(swap_dev.clone());
     let arg_refs: Vec<&str> = mkswap_args.iter().map(|s| s.as_str()).collect();
-    match ctx.run(MKSWAP, &arg_refs, None) {
-        Some(0) => {}
-        Some(c) => ctx.finish(
+    ctx.run_checked(
+        &tool_path(MKSWAP),
+        &arg_refs,
+        None,
+        |c| ctx.finish(
             Status::Partial,
             &format!("target expanded; swap recreation incomplete (mkswap exit {c})"),
             &manual_s3,
             old_root_sectors * SECTOR,
             root_new_size * SECTOR,
         ),
-        None => ctx.finish(Status::Failed, "mkswap spawn failed", &manual_s3, old_root_sectors * SECTOR, 0),
-    }
+        || ctx.finish(Status::Failed, "mkswap spawn failed", &manual_s3, old_root_sectors * SECTOR, 0),
+    );
     ctx.log("surgery S3 complete: swap UUID/label restored");
 
     // S3 → S4：fs 扩容
@@ -1276,10 +1343,11 @@ fn grow_with_surgery(
 
 // ── TUI 消费接口 ───────────────────────────────────────────────────────
 
-/// /run/grow.result 解析结果（严格 key-value，UI 只做 presentation）
+/// /run/grow.result 解析结果（严格 key-value，UI 只做 presentation）。
+/// status 使用强类型 Status 而非字符串，避免 TUI 侧重复解析/拼写错误
 #[derive(Debug, Clone, Default)]
 pub struct GrowOutcome {
-    pub status: String,
+    pub status: Status,
     pub device: String,
     pub reason: String,
     pub manual_cmd: String,
@@ -1295,7 +1363,15 @@ pub fn read_result() -> Option<GrowOutcome> {
         let Some((k, v)) = line.split_once('=') else { continue };
         match k.trim() {
             "status" => {
-                out.status = v.trim().to_string();
+                out.status = match v.trim() {
+                    "disabled" => Status::Disabled,
+                    "expanded" => Status::Expanded,
+                    "skipped" => Status::Skipped,
+                    "partial" => Status::Partial,
+                    "failed" => Status::Failed,
+                    // 契约外的未知值 → 保守按失败处理（与 UI 兜底一致）
+                    _ => Status::Failed,
+                };
                 has_status = true;
             }
             "device" => out.device = v.trim().to_string(),

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::utils::format_bytes;
+use crate::utils::{format_bytes, SECTOR};
 
 /// Information about a single block device, obtained via /sys/block.
 #[derive(Debug, Clone)]
@@ -71,7 +71,7 @@ impl DiskInfo {
             .trim()
             .parse()
             .unwrap_or(0);
-        let size_bytes = sectors * 512;
+        let size_bytes = sectors * SECTOR;
 
         let model = fs::read_to_string(base.join("device/model"))
             .or_else(|_| fs::read_to_string(base.join("device/device/model")))
