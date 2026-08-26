@@ -438,9 +438,9 @@ pub enum GrowAction {
         fs: FsKind,
         surgery: Option<SurgeryPlan>,
         /// 非手术：分析层一次性算出的期望新尺寸（扇区，max 值；
-        /// /sys 比对时扣除 `, +` 的对齐容差）。手术路径为 None（精确值
-        /// 依赖 relocate 后重读 header，属文档明载的分析层例外）
-        expected_new_sectors: Option<u64>,
+        /// /sys 比对时扣除 `, +` 的对齐容差）。手术路径不消费此值
+        /// （精确值依赖 relocate 后重读 header，属文档明载的分析层例外）
+        expected_new_sectors: u64,
         old_sectors: u64,
         is_gpt: bool,
     },
@@ -591,7 +591,10 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
     }
 
     let old_sectors = (candidate.last_lba - candidate.first_lba + 1) * lba_bytes / SECTOR;
-    let expected_new_sectors = surgery.is_none().then(|| usable_end - candidate.first_lba * lba_bytes / SECTOR);
+    let expected_new_sectors = match surgery {
+        Some(_) => 0, // 手术路径不消费（精确值 relocate 后重读）
+        None => usable_end - candidate.first_lba * lba_bytes / SECTOR,
+    };
 
     GrowPlan {
         action: Some(GrowAction::PartitionGrow {
@@ -1222,7 +1225,7 @@ pub fn run_grow(disk: &str) -> ! {
 
                 write_phase("kernel-reread");
                 // /sys 比对消费分析层的 expected 值；扣 `, +` 对齐容差（sfdisk 对齐粒度，自适应）
-                let expected = expected_new_sectors.unwrap_or(0);
+                let expected = expected_new_sectors;
                 let min_size = expected.saturating_sub(tolerance);
                 // 期望值未超过旧尺寸（对齐后无增长空间）→ 已是目标态，无需等待内核同步
                 if old_sectors < min_size && !wait_partition_visible(&ctx, part_num, min_size) {

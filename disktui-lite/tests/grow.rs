@@ -351,7 +351,7 @@ fn analyze_mbr_grows_last_ext4() {
     assert!(!is_gpt);
     assert_eq!(old_sectors, 4096);
     // MBR usable_end = min(device, 2^32) = 10000 → 期望新尺寸 = 10000 − 2048
-    assert_eq!(expected_new_sectors, Some(10000 - 2048));
+    assert_eq!(expected_new_sectors, 10000 - 2048);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -404,7 +404,7 @@ fn analyze_gpt_grows_last_and_sets_gpt_flag() {
     assert!(is_gpt);
     assert!(surgery.is_none());
     // GPT usable_end = device − 33（128 条目 × 128B = 32 扇区 + backup header 1）
-    assert_eq!(expected_new_sectors, Some(10000 - 33 - 2048));
+    assert_eq!(expected_new_sectors, 10000 - 33 - 2048);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -566,7 +566,7 @@ fn analyze_4kn_gpt_lba_unit_conversion() {
     // old = 512 LBA × 4096 / 512 = 4096 sysfs 扇区
     assert_eq!(old_sectors, 4096);
     // reserved = (1+4) LBA = 40 sysfs 扇区；expected = 20000 − 40 − 256×8 = 17912
-    assert_eq!(expected_new_sectors, Some(20000 - 40 - 2048));
+    assert_eq!(expected_new_sectors, 20000 - 40 - 2048);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -592,7 +592,7 @@ fn analyze_4kn_mbr_limit_scales() {
         panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
     };
     assert_eq!(old_sectors, 224 * L / 512); // 224 LBA = 1792 sysfs 扇区
-    assert_eq!(expected_new_sectors, Some(10000 - 32 * L / 512)); // usable_end=10000（低于 2^35 上限）
+    assert_eq!(expected_new_sectors, 10000 - 32 * L / 512); // usable_end=10000（低于 2^35 上限）
     let _ = std::fs::remove_file(&path);
 }
 
