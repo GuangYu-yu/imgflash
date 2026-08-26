@@ -222,12 +222,62 @@ cd ..
 
 dd 写入成功后，安装器自动将目标盘的**最后一个分区**原地扩展到盘尾，并扩展其文件系统（ext4 / XFS / NTFS），填满"盘 > 镜像"产生的尾部空闲空间。失败或跳过仅降级为警告，永不阻塞重启。
 
-- **候选规则**：只扩末分区；若末分区是 swap，则先做"swap 手术"（删除 → 扩倒数第二分区 → 磁盘末尾重建 swap，UUID/PARTUUID/分区号全保留）
-- **跳过场景**：尾部空闲 < 1MiB、FAT/exFAT、Btrfs/LVM/LUKS（v1）、MBR 扩展/逻辑分区
-- **superfloppy**（无分区表镜像）：跳过分区步骤，直接扩文件系统
-- **逃生门**：内核参数 `grow=off` 可在运行期强制禁用
-- **指定分区**：`GROW_PART=<N>`（或 workflow 输入 `grow_part`）为"候选确认"语义——声明的分区必须恰好是自动候选（末分区或 swap 挡尾时的倒数第二），否则 Skip；不存在多分区/按比例的分区重排语法
-- **架构**：工具 + `grow.conf` + `LICENSES.txt` 住 ISO `/grow/`，随每次构建注入（模板再生成也不携带工具）；initramfs 只含 grow 逻辑与条件 xfs.ko，故工具版本与模板解耦
+### 常见布局与处理规则 (Auto-Grow Behavior)
+
+程序的核心逻辑基于**“只看最后一个分区”**的安全策略，以确保不移动、不猜测用户意图。以下是针对常见布局的自动处理行为总结：
+
+#### 第一梯队：极常见 (Dual/Triple Boot)
+| 布局 (从首到尾) | 自动扩容行为 | 说明 |
+| :--- | :--- | :--- |
+| `EFI` + `Root` (ext4/XFS) | **✅ 自动扩容 Root** | 将 Root 分区扩展至盘尾。 |
+| `EFI` + `Root` + `Swap` | **✅ Swap 手术，扩容 Root** | 删除 Swap → 扩 Root → 末尾重建 Swap。 |
+| `EFI` + `Root` + `Data` | **✅ 自动扩容 Data** | 只看最后一个分区，Data 被扩容。**Root 保持不变**。 |
+| `EFI` + `Root` + `Home` | **✅ 自动扩容 Home** | Home 作为最后一个分区被扩容。**Root 保持不变**。 |
+| `EFI` + `Root` + `Swap` + `Data` | **✅ 自动扩容 Data** | Swap 在中间，不触发手术。**Root 和 Swap 都保持不变**。 |
+| `EFI` + `Root` + `Swap` + `Home` | **✅ 自动扩容 Home** | Swap 在中间，Home 为最后一个分区。**Root 和 Swap 都保持不变**。 |
+| `EFI` + `Root` + `Home` + `Data` | **✅ 自动扩容 Data** | 只有最后一个 Data 分区被扩容。**Root 和 Home (被夹在中间) 都保持不变**。 |
+
+#### 第二梯队：LVM 布局
+| 布局 (从首到尾) | 自动扩容行为 | 说明 |
+| :--- | :--- | :--- |
+| `EFI` + `LVM` (单 LV: Root) | **✅ 自动扩容 LVM** | 扩容 PV -> 扩 VG -> 分配给唯一 LV。 |
+| `EFI` + `LVM` (多 LV) | **⚠️ 跳过 (Skipped)** | 无法自动分配空间给哪个 LV (例如 Root 还是 Data)，需手动配置 `lv=xxx` 指定目标。 |
+| `EFI` + `Swap` + `LVM` | **✅ 自动扩容 LVM** | Swap 在中间保持不变，LVM PV 作为末分区被扩容（扩 PV → 扩 VG → 扩 LV）。多 LV 时仍需 `lv=xxx`。 |
+
+#### 第三梯队：Btrfs / LUKS 嵌套
+| 布局 (从首到尾) | 自动扩容行为 | 说明 |
+| :--- | :--- | :--- |
+| `EFI` + `Boot` + `Btrfs` (单设备) | **✅ 自动扩容 Btrfs** | 直接扩容 Btrfs 分区，支持在线 resize。 |
+| `EFI` + `Boot` + `LUKS` (ext4/LVM/Btrfs) | **❌ 跳过 (Skipped)** | 遇到 LUKS 容器直接跳过，风险极高。 |
+
+#### 暂不支持的复杂场景
+| 布局 | 典型需求 | 状态 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `EFI` + `Root` + `Home` | **扩 Root** | **❌ 暂不支持** | `Root` 在中间，需移动 `Home`。违反不移动原则。 |
+| `EFI` + `Root` + `Swap` + `Home` | **扩 Root** | **❌ 暂不支持** | `Root` 在中间，且 `Swap` 无法作为屏障被安全跨越。 |
+| `EFI` + `Root` + `Home` + `Swap` | **扩 Root / Home** | **⚠️ 部分支持** | `Swap` 在末尾，可触发 Swap 手术扩容 `Home`；但 `Root` 在中间，无法扩容。 |
+| `EFI` + `Root` + `Var` + `Home` | **扩 Root / Var** | **❌ 暂不支持** | 被多分区隔离的中间分区无法扩容。 |
+| `EFI` + `Root` + `Var` + `Home` + `Tmp` | **扩 Root / Var / Home** | **❌ 暂不支持** | 多层嵌套隔离，无法自动规划。 |
+
+**核心设计哲学**：
+*   **不猜测，不移动**：绝不移动已存在的有数据分区。
+*   **Swap 是唯一的例外**：Swap 可以被删除和重建（因其无持久数据）。
+*   **默认安全**：无法确定意图的场景，默认跳过，由用户手动处理。
+
+### 高级配置与限制
+
+*   **支持的文件系统**：`ext4`, `XFS`, `NTFS`, **`Btrfs` (单设备)**, **`LVM` (单 LV)**。
+*   **强制指定目标**：`GROW_PART=<N>`（或 `grow.conf` 中的 `part=N`）。
+    *   **限制**：指定的分区必须是**最后一个分区**，或 Swap 手术场景下的**倒数第二个分区**。否则直接跳过（Skip）。
+    *   **不存在**：跨多个分区重排或多分区同时扩容的功能。
+*   **跳过场景 (Skip)**：
+    *   尾部空闲空间不足（< 1MiB）。
+    *   文件系统不支持：FAT/exFAT、**Btrfs (多设备)**、**LVM (多 LV)**、LUKS。
+    *   分区表类型不支持：MBR 扩展/逻辑分区。
+    *   Swap 是最后一个分区，且前一个分区不可扩展（如 FAT）。
+*   **逃生门**：内核参数 `grow=off` 可在运行期强制禁用。
+*   **架构**：工具 + `grow.conf` 住 ISO `/grow/`；**LICENSES.txt 位于 `binaries/<ARCH>/grow/`**，作为随 Release 发布的源提供物，不注入 ISO。
+*   **架构**：initramfs 只含 grow 逻辑与条件 xfs.ko，故工具版本与模板解耦。
 
 安装结果屏会显示一行扩容状态（Expanded / Skipped / Partial / Failed）；Partial 状态附自包含的手动恢复命令（重启后 `/run` 数据即失）。
 
