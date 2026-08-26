@@ -84,7 +84,6 @@ pub struct WriteProgress {
     dd_pid: u32,
     pub(crate) finished: bool,
     pub(crate) success: bool,
-    pub(crate) spinner_index: usize,
 }
 
 impl WriteProgress {
@@ -100,7 +99,6 @@ impl WriteProgress {
             dd_pid: pid,
             finished: false,
             success: false,
-            spinner_index: 0,
         }
     }
 
@@ -187,7 +185,8 @@ impl WriteProgress {
 pub struct GrowProgress {
     pub(crate) disk_name: String,
     pub(crate) phase_text: String,
-    pub(crate) spinner_index: usize,
+    /// 相位文案尾部 1-5 循环动画计数（每 tick 自增）
+    pub(crate) phase_cycle: usize,
     grow_child: Option<Child>,
     last_change: Instant,
     last_mtime: Option<SystemTime>,
@@ -198,7 +197,7 @@ impl GrowProgress {
         Self {
             disk_name: disk_name.to_string(),
             phase_text: "Analyzing disk layout".to_string(),
-            spinner_index: 0,
+            phase_cycle: 0,
             grow_child: Some(child),
             last_change: Instant::now(),
             last_mtime: None,
@@ -334,15 +333,11 @@ impl App {
             n.ttl -= 1;
         }
 
-        // Rotate spinner when writing / growing
-        if self.screen == Screen::Writing {
-            let p = self.progress.as_mut().unwrap();
-            p.spinner_index = (p.spinner_index + 1) % 10;
-        }
+        // Advance grow phase animation counter (1-5 cycle) when growing
         if self.screen == Screen::Growing
             && let Some(g) = self.grow.as_mut()
         {
-            g.spinner_index = (g.spinner_index + 1) % 10;
+            g.phase_cycle = (g.phase_cycle + 1) % 5;
         }
 
         // Reboot countdown (10 ticks = 1 second at 100ms poll)

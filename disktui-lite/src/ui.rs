@@ -3,15 +3,12 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Padding, Paragraph, Row, Table, Wrap},
 };
 
 use crate::app::{App, ConfirmButton, Screen, SuccessAction};
 use crate::grow::Status;
 use crate::utils::format_bytes;
-
-/// 写入/扩容进度屏共用的 spinner 帧（10 帧，与 app.tick 的 % 10 取模对应）
-const SPINNER_CHARS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Center a popup of given width/height within the terminal area.
 fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
@@ -35,14 +32,16 @@ fn dialog_block<'a>(title: &'a str, border_color: Color) -> Block<'a> {
         .borders(Borders::ALL)
         .border_type(BorderType::default())
         .border_style(Style::default().fg(border_color))
+        .padding(Padding::horizontal(2))
 }
 
 /// Render a standard dialog: clear area, draw border block, draw paragraph content.
+/// 超宽行自动换行而非截断；水平间距由 Block padding 统一提供。
 fn render_dialog(frame: &mut Frame, area: Rect, block: Block<'_>, lines: Vec<Line<'_>>) {
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// Render a Yes/No button row centered with consistent spacing.
@@ -333,11 +332,9 @@ fn render_progress_dialog(app: &App, frame: &mut Frame) {
 
     let area = centered_rect(64, 12, frame.area());
 
-    let spinner = SPINNER_CHARS[progress.spinner_index];
-
     let title = format!(
-        " {} Writing to /dev/{} ({}) ",
-        spinner, progress.disk_name, progress.disk_model,
+        " Writing to /dev/{} ({}) ",
+        progress.disk_name, progress.disk_model,
     );
 
     let border_block = Block::default()
@@ -345,7 +342,8 @@ fn render_progress_dialog(app: &App, frame: &mut Frame) {
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::default())
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(2));
 
     let inner = border_block.inner(area);
 
@@ -367,7 +365,7 @@ fn render_progress_dialog(app: &App, frame: &mut Frame) {
     let lines = vec![
         Line::from(""),
         Line::from(format!(
-            "  {:.1}%  {}/{}  {:.1} MB/s",
+            "{:.1}%  {}/{}  {:.1} MB/s",
             pct_display,
             format_bytes(progress.written_bytes),
             format_bytes(progress.total_bytes),
@@ -377,13 +375,13 @@ fn render_progress_dialog(app: &App, frame: &mut Frame) {
         Line::from(""),
         Line::from(bar_str).style(Style::default().fg(Color::Cyan)),
         Line::from(""),
-        Line::from("  Please wait while the image is being written...")
+        Line::from("Please wait while the image is being written...")
             .style(Style::default().fg(Color::DarkGray)),
-        Line::from("  Press Esc to abort and return to disk selection")
+        Line::from("Press Esc to abort and return to disk selection")
             .style(Style::default().fg(Color::DarkGray)),
     ];
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -393,39 +391,42 @@ fn render_progress_dialog(app: &App, frame: &mut Frame) {
 fn render_growing_dialog(app: &App, frame: &mut Frame) {
     let Some(g) = app.grow.as_ref() else { return };
 
-    let area = centered_rect(56, 10, frame.area());
+    let area = centered_rect(56, 11, frame.area());
 
-    let spinner = SPINNER_CHARS[g.spinner_index];
-
-    let title = format!(" {} Expanding /dev/{} ", spinner, g.disk_name);
+    let title = format!(" Expanding /dev/{} ", g.disk_name);
 
     let border_block = Block::default()
         .title(title)
         .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_type(BorderType::default())
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(Color::Cyan))
+        .padding(Padding::horizontal(2));
 
     let inner = border_block.inner(area);
 
     frame.render_widget(Clear, area);
     frame.render_widget(border_block, area);
 
+    // phase_text 为无标点的固定文案（grow.rs 映射），循环点由 UI 渲染 (1-5 cycle)
+    let dots = ".".repeat(g.phase_cycle + 1);
+    let phase = format!("{} {}", g.phase_text, dots);
+
     let lines = vec![
         Line::from(""),
-        Line::from(format!("  {}", g.phase_text))
+        Line::from(phase)
             .style(Style::default().fg(Color::White)),
         Line::from(""),
-        Line::from("  Filling the remaining disk space with the last partition.")
+        Line::from("Filling the remaining disk space with the last partition.")
             .style(Style::default().fg(Color::DarkGray)),
-        Line::from("  Filesystem checks on large disks may take minutes.")
+        Line::from("Filesystem checks on large disks may take minutes.")
             .style(Style::default().fg(Color::DarkGray)),
         Line::from(""),
-        Line::from("  Do NOT power off during this step.")
+        Line::from("Do NOT power off during this step.")
             .style(Style::default().fg(Color::Yellow)),
     ];
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -504,32 +505,43 @@ fn grow_result_lines(app: &App) -> Vec<Line<'static>> {
     };
 
     let mut lines = vec![];
-    let summary = match o.status {
+    match o.status {
+        // 尺寸单独成行：防止 "32.0 GiB → 1.8 TiB" 在自动换行时被从数字中间截开
         Status::Expanded => {
+            lines.push(
+                Line::from(format!("{}: last partition grown to", label))
+                    .style(Style::default().fg(color))
+                    .centered(),
+            );
             let size = if o.old_bytes > 0 {
                 format!("{} → {}", format_bytes(o.old_bytes), format_bytes(o.new_bytes))
             } else {
                 format_bytes(o.new_bytes)
             };
-            format!("last partition grown to {}", size)
+            lines.push(
+                Line::from(size)
+                    .style(Style::default().fg(color).add_modifier(Modifier::BOLD))
+                    .centered(),
+            );
         }
-        _ => o.reason.clone(),
-    };
-    lines.push(
-        Line::from(format!(" {}: {} ", label, summary))
-            .style(Style::default().fg(color))
-            .centered(),
-    );
+        _ => {
+            lines.push(
+                Line::from(format!("{}: {}", label, o.reason))
+                    .style(Style::default().fg(color))
+                    .centered(),
+            );
+        }
+    }
 
     if !o.manual_cmd.is_empty() {
         lines.push(
-            Line::from(" Manual recovery (run after reboot):")
+            Line::from("Manual recovery (run after reboot):")
                 .style(Style::default().fg(Color::Yellow))
                 .centered(),
         );
-        for chunk in wrap_words(&o.manual_cmd, 48) {
+        for chunk in wrap_words(&o.manual_cmd, 46) {
             lines.push(
-                Line::from(format!("   {chunk}"))
+                Line::from(format!("  {chunk}"))
                     .style(Style::default().fg(Color::Yellow)),
             );
         }
@@ -539,7 +551,9 @@ fn grow_result_lines(app: &App) -> Vec<Line<'static>> {
 
 fn render_success_screen(app: &App, frame: &mut Frame) {
     let grow_lines = grow_result_lines(app);
-    let height = (14 + grow_lines.len() as u16).min(frame.area().height.saturating_sub(1));
+    // 内容宽度 50：超过的行经 Wrap 折行后高度 +1
+    let wrapped = grow_lines.iter().filter(|l| l.width() > 50).count() as u16;
+    let height = (14 + grow_lines.len() as u16 + wrapped).min(frame.area().height.saturating_sub(1));
     let area = centered_rect(56, height, frame.area());
     let block = dialog_block(" Installation Successful ", app.theme.success);
 
@@ -575,16 +589,16 @@ fn render_success_screen(app: &App, frame: &mut Frame) {
             .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             .centered(),
         Line::from(""),
-        Line::from("  * Please REMOVE the USB drive or Disc.")
+        Line::from("* Please REMOVE the USB drive or Disc.")
             .style(Style::default().fg(Color::White)),
-        Line::from("  * Ensure media is removed to avoid boot loops.")
+        Line::from("* Ensure media is removed to avoid boot loops.")
             .style(Style::default().fg(Color::White)),
         Line::from(""),
     ]);
 
     if app.reboot_counting {
         lines.push(
-            Line::from(format!("  Rebooting in {} seconds... (Enter to skip)", app.reboot_countdown))
+            Line::from(format!("Rebooting in {} seconds... (Enter to skip)", app.reboot_countdown))
                 .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                 .centered(),
         );
