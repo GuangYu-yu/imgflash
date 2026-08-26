@@ -408,6 +408,15 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
         [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "grow 基础工具 ${t} 缺失"
         cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
     done
+
+    # 版本断言：grow.rs 依赖 --relocate（需 util-linux ≥ 2.29.1）与
+    # --part-uuid/--delete（需 ≥ 2.26），取更高下限。版本行形如 "sfdisk from util-linux 2.38.1"
+    sfdisk_ver=$("${GROW_STAGE}/sfdisk" --version 2>/dev/null \
+        | head -n1 | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)
+    [[ -n "${sfdisk_ver}" ]] || die "无法获取 grow sfdisk 版本"
+    if ! printf '%s\n2.29.1\n' "${sfdisk_ver}" | sort -V | head -n1 | grep -qx '2.29.1'; then
+        die "grow sfdisk 版本 ${sfdisk_ver} 过低：--relocate 需 util-linux ≥ 2.29.1"
+    fi
     if grow_tool_enabled ext4; then
         for t in e2fsck resize2fs; do
             [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "GROW_TOOLS=ext4 但 ${t} 缺失"

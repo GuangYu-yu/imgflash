@@ -70,6 +70,14 @@ fn put_xfs(img: &mut [u8], off: u64) {
     img[b..b + 4].copy_from_slice(b"XFSB");
 }
 
+/// XFS 超级块字段（大端）：blocksize u32@4, dblocks u64@8（xfs_dsb __be32/__be64）
+fn put_xfs_super(img: &mut [u8], off: u64, blocksize: u32, dblocks: u64) {
+    let b = off as usize;
+    img[b..b + 4].copy_from_slice(b"XFSB");
+    img[b + 4..b + 8].copy_from_slice(&blocksize.to_be_bytes());
+    img[b + 8..b + 16].copy_from_slice(&dblocks.to_be_bytes());
+}
+
 fn put_ntfs(img: &mut [u8], off: u64) {
     let b = off as usize;
     img[b + 3..b + 11].copy_from_slice(b"NTFS    ");
@@ -179,7 +187,7 @@ fn parse_table_mbr_basic_and_container() {
     let mut img = mbr_disk(&[(0x83, 2048, 4096), (0x05, 6144, 1024)], 10000);
     put_ext4(&mut img, 2048 * S, 0);
     let mut cur = Cursor::new(img);
-    let t = parse_table(&mut cur).unwrap();
+    let t = parse_table(&mut cur, 512).unwrap();
     assert_eq!(t.label, Label::Mbr);
     assert_eq!(t.entries.len(), 2);
     assert_eq!(t.entries[0].num, 1);
@@ -200,7 +208,7 @@ fn parse_table_gpt_entries_and_header_fields() {
     ];
     let img = gpt_disk(&[(linux_guid, 2048, 6143)], 10000, 9967);
     let mut cur = Cursor::new(img);
-    let t = parse_table(&mut cur).unwrap();
+    let t = parse_table(&mut cur, 512).unwrap();
     assert_eq!(t.label, Label::Gpt);
     assert_eq!(t.entries.len(), 1);
     let e = &t.entries[0];
@@ -219,7 +227,7 @@ fn parse_table_superfloppy_when_no_signature() {
     let mut img = vec![0u8; 10000 * S as usize];
     put_ext4(&mut img, 0, 1000);
     let mut cur = Cursor::new(img);
-    let t = parse_table(&mut cur).unwrap();
+    let t = parse_table(&mut cur, 512).unwrap();
     assert_eq!(t.label, Label::None);
     assert!(t.entries.is_empty());
 }
@@ -229,7 +237,7 @@ fn parse_table_mbr_all_empty_entries_is_superfloppy() {
     let mut img = vec![0u8; 1000 * S as usize];
     sign_mbr(&mut img); // 有 0x55AA 但 4 条目全空
     let mut cur = Cursor::new(img);
-    let t = parse_table(&mut cur).unwrap();
+    let t = parse_table(&mut cur, 512).unwrap();
     assert_eq!(t.label, Label::None);
 }
 
@@ -314,10 +322,14 @@ fn read_swap_info_and_sniff_support_64k_pages() {
 
 #[test]
 fn part_dev_name_naming_rules() {
+    // 内核规则：设备名以数字结尾加 p
     assert_eq!(part_dev_name("sda", 3), "sda3");
     assert_eq!(part_dev_name("nvme0n1", 2), "nvme0n1p2");
     assert_eq!(part_dev_name("mmcblk0", 1), "mmcblk0p1");
-    assert_eq!(part_dev_name("vd b", 1), "vd b1"); // 非 nvme/mmc 前缀直接拼接
+    assert_eq!(part_dev_name("loop0", 1), "loop0p1"); // 前缀表漏掉的数字结尾设备
+    assert_eq!(part_dev_name("md126", 2), "md126p2");
+    assert_eq!(part_dev_name("nbd0", 1), "nbd0p1");
+    assert_eq!(part_dev_name("vd b", 1), "vd b1"); // 非数字结尾直接拼接
 }
 
 #[test]
@@ -326,7 +338,7 @@ fn analyze_mbr_grows_last_ext4() {
     put_ext4(&mut img, 2048 * S, 0);
     let path = temp_img("img", &img);
 
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     let Some(GrowAction::PartitionGrow {
         part_num, fs, surgery, expected_new_sectors, old_sectors, is_gpt, ..
     }) = plan.action
@@ -351,7 +363,7 @@ fn analyze_mbr_swap_surgery_plan() {
     put_swap(&mut img, 6144 * S, &[0xAB; 16], "sw");
     let path = temp_img("img", &img);
 
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     let Some(GrowAction::PartitionGrow { part_num, fs, surgery, .. }) = plan.action else {
         panic!("expected surgery plan, got skip: {:?}", plan.skip_reason);
     };
@@ -381,7 +393,7 @@ fn analyze_gpt_grows_last_and_sets_gpt_flag() {
     put_ext4(&mut img, 2048 * S, 0);
     let path = temp_img("img", &img);
 
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     let Some(GrowAction::PartitionGrow {
         part_num, is_gpt, expected_new_sectors, surgery, ..
     }) = plan.action
@@ -402,7 +414,7 @@ fn analyze_skips_when_no_free_space() {
     let mut img = mbr_disk(&[(0x83, 2048, 7952)], 10000);
     put_ext4(&mut img, 2048 * S, 0);
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     assert!(plan.action.is_none());
     assert_eq!(plan.skip_reason.as_deref(), Some("no free space after last partition"));
     let _ = std::fs::remove_file(&path);
@@ -413,7 +425,7 @@ fn analyze_skips_fat_last_partition() {
     let mut img = mbr_disk(&[(0x0b, 2048, 4096)], 10000);
     put_fat(&mut img, 2048 * S);
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     assert!(plan.action.is_none());
     assert_eq!(plan.skip_reason.as_deref(), Some("FAT/exFAT cannot be resized in place"));
     let _ = std::fs::remove_file(&path);
@@ -424,7 +436,7 @@ fn analyze_skips_mbr_extended_container_last() {
     let mut img = mbr_disk(&[(0x83, 2048, 4096), (0x05, 6144, 1024)], 10000);
     put_ext4(&mut img, 2048 * S, 0);
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     assert!(plan.action.is_none());
     assert_eq!(plan.skip_reason.as_deref(), Some("MBR logical/extended not supported in v1"));
     let _ = std::fs::remove_file(&path);
@@ -435,7 +447,7 @@ fn analyze_swap_only_partition_skips() {
     let mut img = mbr_disk(&[(0x82, 2048, 1024)], 10000);
     put_swap(&mut img, 2048 * S, &[1; 16], "");
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     assert!(plan.action.is_none());
     assert_eq!(plan.skip_reason.as_deref(), Some("swap is the only partition"));
     let _ = std::fs::remove_file(&path);
@@ -448,7 +460,7 @@ fn analyze_swap_last_with_fat_prev_skips() {
     put_fat(&mut img, 2048 * S);
     put_swap(&mut img, 6144 * S, &[1; 16], "");
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     assert!(plan.action.is_none());
     assert_eq!(
         plan.skip_reason.as_deref(),
@@ -463,7 +475,7 @@ fn analyze_superfloppy_ext4_filesystem_only() {
     let mut img = vec![0u8; 10000 * S as usize];
     put_ext4(&mut img, 0, 1000);
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     let Some(GrowAction::FilesystemOnly { fs, fs_dev }) = plan.action else {
         panic!("expected FilesystemOnly, got skip: {:?}", plan.skip_reason);
     };
@@ -479,9 +491,108 @@ fn analyze_superfloppy_full_skips() {
     let mut img = vec![0u8; 10000 * S as usize];
     put_ext4(&mut img, 0, blocks);
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     assert!(plan.action.is_none());
     assert_eq!(plan.skip_reason.as_deref(), Some("no free space after filesystem"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_superfloppy_xfs_end_bytes_big_endian() {
+    // XFS 字段全大端：4096B 块 × 900 块 ≈ 3.5MiB + 1MiB 阈值 < 盘 5MiB → 可扩。
+    // 若误按小端读，4096 的 BE 字节会解出天文数字 → 误判 NoUsefulSpace（本测试防回归）
+    let mut img = vec![0u8; 10000 * S as usize];
+    put_xfs_super(&mut img, 0, 4096, 900);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
+    assert!(
+        matches!(plan.action, Some(GrowAction::FilesystemOnly { fs: FsKind::Xfs, .. })),
+        "expected Xfs FilesystemOnly, got skip: {:?}",
+        plan.skip_reason
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_superfloppy_xfs_full_skips() {
+    // 4096 × 1200 = 4,915,200B + 1MiB 阈值 ≥ 盘 5,120,000B → NoUsefulSpace
+    let mut img = vec![0u8; 10000 * S as usize];
+    put_xfs_super(&mut img, 0, 4096, 1200);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
+    assert!(plan.action.is_none());
+    assert_eq!(plan.skip_reason.as_deref(), Some("no free space after filesystem"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_4kn_gpt_lba_unit_conversion() {
+    // 4Kn 盘：LBA=4096B。2500 LBA = 10,000 sysfs 512B 扇区。
+    // GPT header @LBA1 = 字节偏移 4096（非 512）——4Kn 适配的核心
+    const L: u64 = 4096;
+    let total_lba = 2500u64;
+    let mut img = vec![0u8; (total_lba * L) as usize];
+    img[446 + 4] = 0xEE; // protective MBR（start/size 非零才不被解析层当空条目跳过）
+    img[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+    img[446 + 12..446 + 16].copy_from_slice(&(total_lba as u32 - 1).to_le_bytes());
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    let h = L as usize;
+    img[h..h + 8].copy_from_slice(b"EFI PART");
+    // 条目区 128×128B = 4 LBA；last_usable = 2500 − 1(hdr) − 1(backup hdr) − 4 = 2494
+    img[h + 48..h + 56].copy_from_slice(&2494u64.to_le_bytes());
+    img[h + 72..h + 80].copy_from_slice(&2u64.to_le_bytes());
+    img[h + 80..h + 84].copy_from_slice(&128u32.to_le_bytes());
+    img[h + 84..h + 88].copy_from_slice(&128u32.to_le_bytes());
+    let linux_guid: [u8; 16] = [
+        0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47,
+        0x7D, 0xE4,
+    ];
+    let off = 2 * L as usize;
+    img[off..off + 16].copy_from_slice(&linux_guid);
+    img[off + 32..off + 40].copy_from_slice(&256u64.to_le_bytes()); // p1: LBA 256..767
+    img[off + 40..off + 48].copy_from_slice(&767u64.to_le_bytes());
+    put_ext4(&mut img, 256 * L, 0);
+
+    let path = temp_img("img4k", &img);
+    let device_sys_sectors = total_lba * L / 512; // 20000
+    let plan = analyze_with(&path, "sda", device_sys_sectors, L, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { old_sectors, expected_new_sectors, is_gpt, .. }) =
+        plan.action
+    else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert!(is_gpt);
+    // old = 512 LBA × 4096 / 512 = 4096 sysfs 扇区
+    assert_eq!(old_sectors, 4096);
+    // reserved = (1+4) LBA = 40 sysfs 扇区；expected = 20000 − 40 − 256×8 = 17912
+    assert_eq!(expected_new_sectors, Some(20000 - 40 - 2048));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_4kn_mbr_limit_scales() {
+    // 4Kn MBR：32-bit LBA 上限 = 2^32 LBA = 2^35 sysfs 扇区（非 2^32）。
+    // 小盘（10000 sysfs 扇区 = 1250 LBA）不受上限影响，验证换算不越界
+    const L: u64 = 4096;
+    let total_lba = 1250u64;
+    let mut img = vec![0u8; (total_lba * L) as usize];
+    // p1: LBA 32..255（对齐 128KiB）
+    img[446 + 4] = 0x83;
+    img[446 + 8..446 + 12].copy_from_slice(&32u32.to_le_bytes());
+    img[446 + 12..446 + 16].copy_from_slice(&224u32.to_le_bytes());
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    put_ext4(&mut img, 32 * L, 0);
+    let path = temp_img("img4k-mbr", &img);
+    let device_sys_sectors = total_lba * L / 512; // 10000
+    let plan = analyze_with(&path, "sda", device_sys_sectors, L, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { old_sectors, expected_new_sectors, .. }) = plan.action
+    else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(old_sectors, 224 * L / 512); // 224 LBA = 1792 sysfs 扇区
+    assert_eq!(expected_new_sectors, Some(10000 - 32 * L / 512)); // usable_end=10000（低于 2^35 上限）
     let _ = std::fs::remove_file(&path);
 }
 
@@ -492,7 +603,7 @@ fn analyze_declared_part_mismatch_skips() {
     put_ext4(&mut img, 2048 * S, 0);
     let path = temp_img("img", &img);
     let policy = GrowPolicy { enabled: true, part: PartSpec::Number(2), lv: None };
-    let plan = analyze_with(&path, "sda", 10000, &policy);
+    let plan = analyze_with(&path, "sda", 10000, 512, &policy);
     assert!(plan.action.is_none());
     assert!(plan.skip_reason.as_deref().unwrap().contains("not the growth candidate"));
     let _ = std::fs::remove_file(&path);
@@ -504,7 +615,7 @@ fn analyze_declared_part_matching_candidate_proceeds() {
     put_ext4(&mut img, 2048 * S, 0);
     let path = temp_img("img", &img);
     let policy = GrowPolicy { enabled: true, part: PartSpec::Number(1), lv: None };
-    let plan = analyze_with(&path, "sda", 10000, &policy);
+    let plan = analyze_with(&path, "sda", 10000, 512, &policy);
     assert!(plan.action.is_some(), "declared part matching candidate should grow");
     let _ = std::fs::remove_file(&path);
 }
@@ -519,7 +630,7 @@ fn analyze_mbr_grows_last_btrfs_single_device() {
     put_btrfs(&mut img, 2048 * S, 1);
     let path = temp_img("img", &img);
 
-    let plan = analyze_with(&path, "sda", 20000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
     let Some(GrowAction::PartitionGrow { part_num, fs, surgery, .. }) = plan.action else {
         panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
     };
@@ -535,7 +646,7 @@ fn analyze_skips_btrfs_multi_device() {
     put_btrfs(&mut img, 2048 * S, 2); // num_devices=2 → 多设备
     let path = temp_img("img", &img);
 
-    let plan = analyze_with(&path, "sda", 20000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
     assert!(plan.action.is_none());
     assert_eq!(plan.skip_reason.as_deref(), Some("btrfs multi-device filesystem"));
     let _ = std::fs::remove_file(&path);
@@ -546,7 +657,7 @@ fn analyze_skips_btrfs_multi_device_superfloppy() {
     let mut img = vec![0u8; 20000 * S as usize];
     put_btrfs(&mut img, 0, 3);
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 20000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
     assert!(plan.action.is_none());
     assert_eq!(plan.skip_reason.as_deref(), Some("btrfs multi-device filesystem"));
     let _ = std::fs::remove_file(&path);
@@ -559,7 +670,7 @@ fn analyze_mbr_grows_last_lvm_pv() {
     put_lvm(&mut img, 2048 * S);
     let path = temp_img("img", &img);
 
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     let Some(GrowAction::PartitionGrow { part_num, fs, surgery, .. }) = plan.action else {
         panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
     };
@@ -577,7 +688,7 @@ fn analyze_swap_last_with_lvm_prev_surgery() {
     put_swap(&mut img, 6144 * S, &[0xAB; 16], "sw");
     let path = temp_img("img", &img);
 
-    let plan = analyze_with(&path, "sda", 10000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 10000, 512, &enabled_policy());
     let Some(GrowAction::PartitionGrow { part_num, fs, surgery, .. }) = plan.action else {
         panic!("expected surgery plan, got skip: {:?}", plan.skip_reason);
     };
@@ -593,7 +704,7 @@ fn analyze_btrfs_superfloppy_filesystem_only() {
     let mut img = vec![0u8; 20000 * S as usize];
     put_btrfs(&mut img, 0, 1);
     let path = temp_img("img", &img);
-    let plan = analyze_with(&path, "sda", 20000, &enabled_policy());
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
     let Some(GrowAction::FilesystemOnly { fs, .. }) = plan.action else {
         panic!("expected FilesystemOnly, got skip: {:?}", plan.skip_reason);
     };
