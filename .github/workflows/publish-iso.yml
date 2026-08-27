@@ -31,17 +31,33 @@ on:
         type: boolean
         default: false
       auto_grow:
-        description: 'dd 后自动扩容末分区'
+        description: 'dd 后自动扩容'
         type: boolean
         default: true
       grow_part:
-        description: '指定扩容分区号（留空=自动取末分区）'
+        description: '指定扩容分区号（留空=自动选择）'
         required: false
         default: ''
-      grow_fs:
-        description: '扩容文件系统（逗号分隔: ext4,xfs,ntfs,btrfs,lvm；留空=全部）'
-        required: false
-        default: ''
+      grow_fs_ext4:
+        description: '打包扩容工具: ext4'
+        type: boolean
+        default: true
+      grow_fs_xfs:
+        description: '打包扩容工具: xfs'
+        type: boolean
+        default: true
+      grow_fs_ntfs:
+        description: '打包扩容工具: ntfs'
+        type: boolean
+        default: true
+      grow_fs_btrfs:
+        description: '打包扩容工具: btrfs'
+        type: boolean
+        default: true
+      grow_fs_lvm:
+        description: '打包扩容工具: lvm'
+        type: boolean
+        default: true
       # use_tui:
       #   description: '使用 TUI'
       #   type: boolean
@@ -164,8 +180,16 @@ jobs:
         run: sed -i "s/^GROW_PART=.*/GROW_PART=${{ github.event.inputs.grow_part }}/" build.env
 
       - name: "设置扩容文件系统"
-        if: ${{ github.event.inputs.grow_fs != '' }}
-        run: sed -i "s/^GROW_TOOLS=.*/GROW_TOOLS=${{ github.event.inputs.grow_fs }}/" build.env
+        run: |
+          TOOLS=""
+          [ "${{ github.event.inputs.grow_fs_ext4 }}" == "true" ] && TOOLS="${TOOLS} ext4"
+          [ "${{ github.event.inputs.grow_fs_xfs }}" == "true" ] && TOOLS="${TOOLS} xfs"
+          [ "${{ github.event.inputs.grow_fs_ntfs }}" == "true" ] && TOOLS="${TOOLS} ntfs"
+          [ "${{ github.event.inputs.grow_fs_btrfs }}" == "true" ] && TOOLS="${TOOLS} btrfs"
+          [ "${{ github.event.inputs.grow_fs_lvm }}" == "true" ] && TOOLS="${TOOLS} lvm"
+          TOOLS="${TOOLS# }"
+          TOOLS="${TOOLS// /,}"
+          sed -i "s/^GROW_TOOLS=.*/GROW_TOOLS=\"${TOOLS}\"/" build.env
 
       # - name: "设置安装器模式为 Shell"
       #   if: ${{ github.event.inputs.use_tui != 'true' }}

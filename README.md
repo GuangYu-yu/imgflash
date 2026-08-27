@@ -166,9 +166,9 @@ cd ..
 | `INCLUDE_VIRT` | 虚拟化模块开关 | `1` |
 | `ENABLE_SECURE_BOOT` | Secure Boot 支持 | `0` |
 | `USE_TUI` | 安装器模式（1=TUI / 0=Shell） | `1` |
-| `GROW_ENABLED` | dd 后自动扩容末分区（构建期开关，1=工具随构建注入 ISO `/grow/`） | `1` |
-| `GROW_PART` | 指定扩容分区号（`auto`=自动取末分区；候选校验失败则跳过） | `auto` |
-| `GROW_TOOLS` | 注入哪些文件系统扩容工具到 ISO `/grow/`（`ext4,xfs,ntfs` 子集；sfdisk/mkswap/partx 为核心依赖无条件注入） | `"ext4,xfs,ntfs"` |
+| `GROW_ENABLED` | dd 后自动扩容（构建期开关，1=工具随构建注入 ISO `/grow/`） | `1` |
+| `GROW_PART` | 指定扩容分区号（`auto`=自动选择；候选校验失败则跳过） | `auto` |
+| `GROW_TOOLS` | 注入哪些文件系统扩容工具到 ISO `/grow/`（`ext4,xfs,ntfs,btrfs,lvm` 子集；sfdisk/mkswap/partx 为核心依赖无条件注入） | `"ext4,xfs,ntfs,btrfs,lvm"` |
 | `BOOT_TIMEOUT` | 启动菜单超时（秒） | `0` |
 | `KERNEL_PARAMS` | 内核启动参数 | `quiet` |
 | `SCAN_TIMEOUT` | 启动时扫描介质的超时秒数 | `10` |
@@ -220,11 +220,11 @@ cd ..
 
 ## 自动扩容（Auto-Grow）
 
-dd 写入成功后，安装器自动将目标盘的**最后一个分区**原地扩展到盘尾，并扩展其文件系统（ext4 / XFS / NTFS），填满"盘 > 镜像"产生的尾部空闲空间。失败或跳过仅降级为警告，永不阻塞重启。
+dd 写入成功后，安装器自动将目标盘尾部空闲空间分配给可扩容分区（末分区；若末分区为 swap，则手术重建 swap 并扩容其前一分区），并扩展其文件系统（ext4 / XFS / NTFS / Btrfs / LVM），填满"盘 > 镜像"产生的尾部空闲空间。失败或跳过仅降级为警告，永不阻塞重启。
 
 ### 常见布局与处理规则 (Auto-Grow Behavior)
 
-程序的核心逻辑基于**“只看最后一个分区”**的安全策略，以确保不移动、不猜测用户意图。以下是针对常见布局的自动处理行为总结：
+程序的核心逻辑基于**"只看尾部候选分区"**的安全策略（候选 = 末分区；末分区为 swap 时取其前一分区），以确保不移动、不猜测用户意图。以下是针对常见布局的自动处理行为总结：
 
 #### 第一梯队：极常见 (Dual/Triple Boot)
 | 布局 (从首到尾) | 自动扩容行为 | 说明 |
