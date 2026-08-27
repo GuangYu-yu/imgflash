@@ -149,7 +149,7 @@ cd ..
 |------|------|--------|
 | `ARCH` | 目标架构（amd64 / arm64） | `amd64` |
 | `DEBIAN_MIRROR` | Debian 镜像源 | `https://ftp.debian.org/debian` |
-| `DEBIAN_SUITE` | Debian 套件版本 | `trixie` |
+| `DEBIAN_SUITE` | Debian 套件版本（留空=自动获取最新稳定版代号） | 留空（自动） |
 | `VOLUME_LABEL` | ISO 卷标 | `IMGFLASH` |
 | `MOD_FILESYSTEM` | 文件系统模块（squashfs / isofs / loop） | 见 build.env |
 | `MOD_NLS` | NLS 字符集模块 | 见 build.env |

@@ -12,6 +12,13 @@ source "${ENV_FILE}"
 
 die() { echo "错误：$*" >&2; exit 1; }
 
+# --- DEBIAN_SUITE 留空时自动获取最新稳定版代号（dists/stable/Release 的 Codename） ---
+if [[ -z "${DEBIAN_SUITE:-}" ]]; then
+    DEBIAN_SUITE="$(curl -fsSL "${DEBIAN_MIRROR}/dists/stable/Release" | awk '/^Codename:/{print $2; exit}')" \
+        || die "无法获取 Debian 最新稳定版代号（${DEBIAN_MIRROR}）"
+    [[ -n "${DEBIAN_SUITE}" ]] || die "Debian Release 文件中未找到 Codename"
+fi
+
 # --- 架构映射 ---
 case "${ARCH}" in
     amd64)
