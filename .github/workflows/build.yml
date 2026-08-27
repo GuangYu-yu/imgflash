@@ -36,6 +36,10 @@ on:
         description: '指定扩容分区号（留空=自动取末分区）'
         required: false
         default: ''
+      grow_fs:
+        description: '扩容文件系统（逗号分隔: ext4,xfs,ntfs,btrfs,lvm；留空=全部）'
+        required: false
+        default: ''
       no_cache:
         description: '不使用缓存，强制重新构建'
         type: boolean
@@ -146,6 +150,10 @@ jobs:
       - name: "设置扩容分区覆盖"
         if: ${{ github.event.inputs.grow_part != '' }}
         run: sed -i "s/^GROW_PART=.*/GROW_PART=${{ github.event.inputs.grow_part }}/" build.env
+
+      - name: "设置扩容文件系统"
+        if: ${{ github.event.inputs.grow_fs != '' }}
+        run: sed -i "s/^GROW_TOOLS=.*/GROW_TOOLS=${{ github.event.inputs.grow_fs }}/" build.env
 
       # - name: "设置安装器模式为 Shell"
       #   if: ${{ github.event.inputs.use_tui != 'true' }}
