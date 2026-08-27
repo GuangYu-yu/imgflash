@@ -179,11 +179,8 @@ jobs:
           ARCH: ${{ github.event.inputs.arch }}
           ENABLE_SECURE_BOOT: ${{ github.event.inputs.secure_boot && '1' || '0' }}
         run: |
-          OUTPUT_NAME="${{ github.event.inputs.iso_name }}"
-          [ -z "${OUTPUT_NAME}" ] && OUTPUT_NAME="imgflash"
-          
           ARGS="-u ${{ github.event.inputs.download_url }}"
-          ARGS="$ARGS -n ${OUTPUT_NAME}"
+          [ -n "${{ github.event.inputs.iso_name }}" ] && ARGS="$ARGS -n ${{ github.event.inputs.iso_name }}"
           [ -n "${{ github.event.inputs.sha256 }}" ] && ARGS="$ARGS -c ${{ github.event.inputs.sha256 }}"
           
           docker run --rm --privileged \
