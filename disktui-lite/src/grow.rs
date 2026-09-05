@@ -3,7 +3,7 @@
 //! 分层契约：
 //! - 分析层只读（分区表/GPT header/fs 魔数），空间算术只在分析层发生一次，
 //!   产出 immutable expected 值；执行层只比对消费、禁止重新推导布局。
-//!   例外（文档明载）：swap 手术的精确扇区算术依赖 relocate 后重读的
+//!   例外：swap 手术的精确扇区算术依赖 relocate 后重读的
 //!   last_usable_lba（dd 后盘上该字段是镜像旧尺寸的过期值）。
 //! - sfdisk 是唯一分区表写入者；swap 是唯一允许删除重建的分区（易失可重建）。
 //! - 五态模型 Disabled/Skipped/Expanded/Partial/Failed，划界原则 =
@@ -29,7 +29,7 @@ const MIN_FREE_SECTORS: u64 = 2048;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POLL_TRIES: u32 = 100;
 /// hang 超时：grow.status mtime 停滞且子进程仍在运行 → Failed。
-/// 依据 = max(600s, Gate 4 实测最慢工具耗时 × 3) 的下界
+/// 下界 = max(600s, 实测最慢工具耗时 × 3)
 pub const HANG_TIMEOUT: Duration = Duration::from_secs(600);
 
 // ── 策略层 ──────────────────────────────────────────────────────────────
@@ -136,8 +136,8 @@ pub struct PartTable {
     pub entries: Vec<PartEntry>,
     /// GPT: (条目数, 条目字节数)——推导 backup 结构保留区，不硬编码 33
     pub gpt_meta: Option<(u32, u32)>,
-    /// GPT header.last_usable_lba。注意：dd 后盘上这是镜像旧尺寸的过期值，
-    /// 仅手术精确算术使用且须 relocate 后重读
+    /// GPT header.last_usable_lba。注意：dd 后盘上这是镜像旧尺寸的过期值；
+    /// 运行时不消费（手术路径 relocate 后经 read_gpt_header 重读），仅供测试断言
     pub gpt_last_usable_lba: Option<u64>,
 }
 
@@ -162,7 +162,7 @@ fn le32(b: &[u8]) -> u32 {
 fn le64(b: &[u8]) -> u64 {
     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
-/// XFS 磁盘结构全大端（内核 xfs_dsb 为 __be32/__be64，SGI 官方文档明示）
+/// XFS 磁盘结构全大端（内核 xfs_dsb 为 __be32/__be64）
 fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
@@ -207,7 +207,8 @@ pub fn parse_table(dev: &mut dyn ReadSeek, lba_bytes: u64) -> Option<PartTable> 
 
     let mut entries = Vec::new();
     for i in 0..4u32 {
-        let e = &lba0[446 + i as usize * 16..462 + i as usize * 16];
+        let base = 446 + i as usize * 16;
+        let e = &lba0[base..base + 16];
         let ptype = e[4];
         if ptype == 0 {
             continue;
@@ -221,7 +222,7 @@ pub fn parse_table(dev: &mut dyn ReadSeek, lba_bytes: u64) -> Option<PartTable> 
             num: i + 1,
             first_lba: start,
             last_lba: start + sectors - 1,
-            is_container: ptype == 0x05 || ptype == 0x0f,
+            is_container: ptype == 0x05 || ptype == 0x0f || ptype == 0x85,
             ptype: format!("{:02x}", ptype),
             partuuid: None,
         });
@@ -233,13 +234,23 @@ pub fn parse_table(dev: &mut dyn ReadSeek, lba_bytes: u64) -> Option<PartTable> 
         if read_at(dev, lba_bytes, &mut lba1) == 512 && &lba1[0..8] == b"EFI PART" {
             let entry_lba = le64(&lba1[72..80]);
             let num_entries = le32(&lba1[80..84]);
-            let entry_size = le32(&lba1[84..88]).max(128);
+            // UEFI 规范：SizeOfPartitionEntry = 128×2ⁿ；条目数无规范上界，
+            // 损坏值会使逐条读取扫到设备尾——防御性上界 65536
+            let entry_size = le32(&lba1[84..88]);
+            if entry_size < 128 || !entry_size.is_power_of_two() || num_entries > 65536 {
+                return None;
+            }
             let last_usable = le64(&lba1[48..56]);
             let mut gpt_entries = Vec::new();
-            let mut buf = vec![0u8; entry_size as usize];
+            // 条目内容字段全在前 128B 内（type/GUID/first/last @0..64）——
+            // 无论 entry_size 多大只读固定 128B，杜绝按盘上值分配内存
+            let mut buf = [0u8; 128];
             for i in 0..num_entries {
-                let off = entry_lba * lba_bytes + i as u64 * entry_size as u64;
-                if read_at(dev, off, &mut buf) < entry_size as usize {
+                // entry_lba/entry_size 都是盘上可控值——saturating 防溢出
+                let off = entry_lba
+                    .saturating_mul(lba_bytes)
+                    .saturating_add((i as u64).saturating_mul(entry_size as u64));
+                if read_at(dev, off, &mut buf) < 128 {
                     break;
                 }
                 if buf[0..16].iter().all(|&b| b == 0) {
@@ -305,7 +316,7 @@ pub fn sniff_fs(dev: &mut dyn ReadSeek, part_offset: u64) -> FsKind {
     if magic(buf, 0, b"LUKS\xBA\xBE") {
         return FsKind::Luks;
     }
-    // LVM 标签可位于前 4 扇区任意位置（lvm 自身即按此扫描；mkfs 默认写 512）
+    // LVM 标签位于前 4 扇区之一的扇区对齐槽位（LVM2 label 恒扇区对齐，pvcreate 默认第 2 扇区）
     if (0..4).any(|s| magic(buf, s * 512, b"LABELONE")) {
         return FsKind::Lvm;
     }
@@ -315,11 +326,7 @@ pub fn sniff_fs(dev: &mut dyn ReadSeek, part_offset: u64) -> FsKind {
     if magic(buf, 0x36, b"FAT") || magic(buf, 0x52, b"FAT") {
         return FsKind::Fat;
     }
-    // 魔数在页尾：4096/8192/65536 页大小（aarch64 64K pages 内核在 65526）
-    if magic(buf, 4086, b"SWAPSPACE2")
-        || magic(buf, 8186, b"SWAPSPACE2")
-        || magic(buf, 65526, b"SWAPSPACE2")
-    {
+    if is_swap_magic(buf) {
         return FsKind::Swap;
     }
     if magic(buf, 0x8001, b"CD001") {
@@ -328,8 +335,8 @@ pub fn sniff_fs(dev: &mut dyn ReadSeek, part_offset: u64) -> FsKind {
     FsKind::Unknown
 }
 
-/// btrfs 多设备判定：超级块 @0x10000 的 num_devices 字段（相对偏移 0x88，u64 LE，
-/// 官方 On-disk Format 文档核实）。>1 表示多设备/RAID——`resize max` 语义按 devid
+/// btrfs 多设备判定：超级块 @0x10000 的 num_devices 字段（相对偏移 0x88，u64 LE）。
+/// 大于 1 表示多设备/RAID——`resize max` 语义按 devid
 /// 分配，不能一次到位，跳过（分区扩容本身安全，fs 层留给用户手动处理）
 fn btrfs_multi_device(dev: &mut dyn ReadSeek, part_offset: u64) -> bool {
     let mut sb = [0u8; 0x90];
@@ -346,10 +353,7 @@ pub fn read_swap_info(dev: &mut dyn ReadSeek, part_offset: u64) -> Option<SwapIn
     let mut page = [0u8; 65536];
     let n = read_at(dev, part_offset, &mut page);
     let page = &page[..n];
-    if !(magic(page, 4086, b"SWAPSPACE2")
-        || magic(page, 8186, b"SWAPSPACE2")
-        || magic(page, 65526, b"SWAPSPACE2"))
-    {
+    if !is_swap_magic(page) {
         return None;
     }
     // mkswap -U / libuuid uuid_parse 只接受 8-4-4-4-12 带连字符格式，swap 头字节序即 uuid_unparse 顺序
@@ -367,8 +371,15 @@ pub fn read_swap_info(dev: &mut dyn ReadSeek, part_offset: u64) -> Option<SwapIn
     Some(SwapInfo { uuid, label })
 }
 
+/// swap 魔数在页尾，按页大小三档（4K/8K/64K page）
+const SWAP_MAGIC_OFFSETS: [usize; 3] = [4086, 8186, 65526];
+
+fn is_swap_magic(buf: &[u8]) -> bool {
+    SWAP_MAGIC_OFFSETS.iter().any(|&off| magic(buf, off, b"SWAPSPACE2"))
+}
+
 /// superfloppy 的 fs 末尾估算（NoUsefulSpace 判定用；不可得 → None → 直接执行，工具幂等）
-fn fs_end_bytes(dev: &mut dyn ReadSeek, offset: u64) -> Option<u64> {
+fn superfloppy_fs_end_bytes(dev: &mut dyn ReadSeek, offset: u64) -> Option<u64> {
     let mut sb = [0u8; 1024];
     let n = read_at(dev, offset, &mut sb);
     let sb = &sb[..n];
@@ -378,7 +389,7 @@ fn fs_end_bytes(dev: &mut dyn ReadSeek, offset: u64) -> Option<u64> {
     // btrfs：超级块 @+0x10000（不在开头 1KB 内），total_bytes u64@0x70（官方 On-disk Format）
     let mut bsb = [0u8; 0x78];
     if read_at(dev, offset + 0x10000, &mut bsb) == 0x78 && magic(&bsb, 0x40, b"_BHRfS_M") {
-        return Some(offset + le64(&bsb[0x70..0x78]));
+        return Some(offset.saturating_add(le64(&bsb[0x70..0x78])));
     }
     if magic(sb, 3, b"NTFS    ") {
         // NTFS BPB：bytes/sector @0x0B, sectors/cluster @0x0D, total sectors @0x28
@@ -386,20 +397,26 @@ fn fs_end_bytes(dev: &mut dyn ReadSeek, offset: u64) -> Option<u64> {
         let spc = sb[0x0d] as u64;
         let total = le64(&sb[0x28..0x30]);
         let total = if total == 0 { le32(&sb[0x13..0x17]) as u64 } else { total };
-        return (bps > 0 && spc > 0).then(|| bps * spc * total);
+        if bps == 0 || spc == 0 {
+            return None;
+        }
+        return Some(bps.saturating_mul(spc).saturating_mul(total));
     }
     if magic(sb, 0, b"XFSB") {
         // XFS：blocksize u32@4, dblocks u64@8（大端，xfs_dsb __be32/__be64）
         let bs = be32(&sb[4..8]) as u64;
         let dblocks = be64(&sb[8..16]);
-        return (bs > 0).then(|| bs * dblocks);
+        if bs == 0 {
+            return None;
+        }
+        return Some(bs.saturating_mul(dblocks));
     }
     // ext：superblock @fs+1024，魔数 @+0x438 已由 sniff 确认
     let mut esb = [0u8; 1024];
     let n = read_at(dev, offset + 1024, &mut esb);
     let esb = &esb[..n];
     if esb.len() >= 0x160 && magic(esb, 0x38, &[0x53, 0xef]) {
-        let log_bs = le32(&esb[0x18..0x1c]) as u64;
+        let log_bs = le32(&esb[0x18..0x1c]);
         let blocks_lo = le32(&esb[0x4..0x8]) as u64;
         let incompat = le32(&esb[0x60..0x64]);
         let blocks = if incompat & 0x80 != 0 {
@@ -407,7 +424,9 @@ fn fs_end_bytes(dev: &mut dyn ReadSeek, offset: u64) -> Option<u64> {
         } else {
             blocks_lo
         };
-        return Some(blocks * (1024u64 << log_bs));
+        // log_bs 来自盘上 u32——checked_shl 同时挡移位位数溢出与块大小值溢出
+        let bs = 1024u64.checked_shl(log_bs)?;
+        return blocks.checked_mul(bs);
     }
     None
 }
@@ -439,7 +458,7 @@ pub enum GrowAction {
         surgery: Option<SurgeryPlan>,
         /// 非手术：分析层一次性算出的期望新尺寸（扇区，max 值；
         /// /sys 比对时扣除 `, +` 的对齐容差）。手术路径不消费此值
-        /// （精确值依赖 relocate 后重读 header，属文档明载的分析层例外）
+        /// （精确值依赖 relocate 后重读 header）
         expected_new_sectors: u64,
         old_sectors: u64,
         is_gpt: bool,
@@ -462,7 +481,7 @@ fn unsupported_reason(fs: FsKind) -> String {
         FsKind::Luks => "LUKS encryption not supported".into(),
         FsKind::Fat | FsKind::Exfat => "FAT/exFAT cannot be resized in place".into(),
         FsKind::Iso9660 => "ISO9660 filesystem".into(),
-        FsKind::Swap => "swap is the only partition".into(),
+        FsKind::Swap => "swap on superfloppy is not growable".into(),
         FsKind::Unknown => "unknown filesystem".into(),
         _ => "unsupported filesystem".into(),
     }
@@ -500,8 +519,10 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
             if fs == FsKind::Btrfs && btrfs_multi_device(&mut f, 0) {
                 return skip("btrfs multi-device filesystem");
             }
-            if let Some(fs_end) = fs_end_bytes(&mut f, 0)
-                && fs_end + MIN_FREE_SECTORS * SECTOR >= device_sectors * SECTOR
+            // fs_end 来自盘上 superblock，损坏时可能为超大值——用减法 + saturating 防溢出
+            if let Some(fs_end) = superfloppy_fs_end_bytes(&mut f, 0)
+                && device_sectors.saturating_mul(SECTOR).saturating_sub(fs_end)
+                    < MIN_FREE_SECTORS * SECTOR
             {
                 return skip("no free space after filesystem");
             }
@@ -529,20 +550,21 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
         Label::Gpt => {
             let (n, esz) = table.gpt_meta.unwrap_or((128, 128));
             let reserved_lba = 1 + (n as u64 * esz as u64).div_ceil(lba_bytes);
-            device_sectors.saturating_sub(reserved_lba * lba_bytes / SECTOR)
+            device_sectors.saturating_sub(lba_to_sysfs(reserved_lba, lba_bytes))
         }
         // MBR 32-bit LBA 上限（512 盘 = 2^32 扇区；4Kn 盘 = 2^35）
-        _ => device_sectors.min((1u64 << 32) * lba_bytes / SECTOR),
+        _ => device_sectors.min(lba_to_sysfs(1u64 << 32, lba_bytes)),
     };
-    let free = usable_end.saturating_sub((last.last_lba + 1) * lba_bytes / SECTOR);
+    // last_lba 来自盘上分区表，损坏时可达 u64::MAX——saturating 防溢出
+    let free = usable_end.saturating_sub(lba_to_sysfs(last.last_lba.saturating_add(1), lba_bytes));
     if free < MIN_FREE_SECTORS {
         return skip("no free space after last partition");
     }
 
     // 候选选择（最高级不变量"绝不移动有持久数据的分区"的直接推论）：
     // 可扩集合 = {末分区} ∪ {末分区=swap 时的倒数第二分区}
-    let last_fs = sniff_fs(&mut f, last.first_lba * lba_bytes);
-    if last_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, last.first_lba * lba_bytes) {
+    let last_fs = sniff_fs(&mut f, lba_to_bytes(last.first_lba, lba_bytes));
+    if last_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) {
         return skip("btrfs multi-device filesystem");
     }
     let (candidate, surgery) = if last_fs == FsKind::Swap {
@@ -552,14 +574,14 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
         if prev.is_container {
             return skip("MBR logical/extended not supported in v1");
         }
-        let prev_fs = sniff_fs(&mut f, prev.first_lba * lba_bytes);
-        if prev_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, prev.first_lba * lba_bytes) {
+        let prev_fs = sniff_fs(&mut f, lba_to_bytes(prev.first_lba, lba_bytes));
+        if prev_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, lba_to_bytes(prev.first_lba, lba_bytes)) {
             return skip("btrfs multi-device filesystem");
         }
         if !is_growable(prev_fs) {
             return skip("swap last, no growable partition before it");
         }
-        let Some(si) = read_swap_info(&mut f, last.first_lba * lba_bytes) else {
+        let Some(si) = read_swap_info(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) else {
             return skip("cannot read swap header");
         };
         let plan = SurgeryPlan {
@@ -590,10 +612,10 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
         return skip(&format!("partition {n} is not the growth candidate (candidate: partition {})", candidate.num));
     }
 
-    let old_sectors = (candidate.last_lba - candidate.first_lba + 1) * lba_bytes / SECTOR;
+    let old_sectors = lba_to_sysfs(candidate.last_lba - candidate.first_lba + 1, lba_bytes);
     let expected_new_sectors = match surgery {
         Some(_) => 0, // 手术路径不消费（精确值 relocate 后重读）
-        None => usable_end - candidate.first_lba * lba_bytes / SECTOR,
+        None => usable_end - lba_to_sysfs(candidate.first_lba, lba_bytes),
     };
 
     GrowPlan {
@@ -601,7 +623,7 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
             part_num: candidate.num,
             part_dev: format!("/dev/{}", part_dev_name(disk_name, candidate.num)),
             fs: match surgery {
-                Some(_) => sniff_fs(&mut f, candidate.first_lba * lba_bytes), // 手术目标 fs（倒数第二分区）
+                Some(_) => sniff_fs(&mut f, lba_to_bytes(candidate.first_lba, lba_bytes)), // 手术目标 fs（倒数第二分区）
                 None => last_fs,
             },
             surgery,
@@ -684,10 +706,32 @@ fn log_line(msg: &str) {
     }
 }
 
+/// /sys/block/*/size 单位（内核 ABI 恒 512B 扇区）
+type SysfsSectors = u64;
+/// 分区表 LBA 单位（= 逻辑块大小，4Kn 盘为 4096）
+type LbaSectors = u64;
+
+/// LBA → sysfs 扇区（全文件唯一换算点）。LBA 输入含盘上可控数据（损坏的
+/// GPT 条目可达任意值），saturating 防溢出
+fn lba_to_sysfs(lba: LbaSectors, lba_bytes: u64) -> SysfsSectors {
+    lba.saturating_mul(lba_bytes) / SECTOR
+}
+
+/// sysfs → LBA 扇区（手术路径 MBR 上限换算专用）
+fn sysfs_to_lba(sysfs: SysfsSectors, lba_bytes: u64) -> LbaSectors {
+    sysfs.saturating_mul(SECTOR) / lba_bytes
+}
+
+/// LBA → 字节偏移（sniff_fs/read_swap_info 的设备内偏移用）。LBA 输入
+/// 含盘上可控数据（损坏分区表条目可达任意值），saturating 防溢出
+fn lba_to_bytes(lba: LbaSectors, lba_bytes: u64) -> u64 {
+    lba.saturating_mul(lba_bytes)
+}
+
 /// 目标盘几何（sysfs 一次读取的成对值）。
 /// 全文件单位约定：device_sectors 是 sysfs 512B 扇区单位（/sys/block/*/size，
 /// 内核 ABI 恒 512B）；lba_bytes 是分区表 LBA 单位（= 逻辑块大小，4Kn 盘为 4096）。
-/// 两者换算 = `* lba_bytes / SECTOR`；容量字段（old/expected_sectors）统一用 sysfs 单位
+/// 两者换算统一走 lba_to_sysfs/sysfs_to_lba；容量字段（old/expected_sectors）统一用 sysfs 单位
 struct DiskGeometry {
     device_sectors: u64,
     lba_bytes: u64,
@@ -748,6 +792,18 @@ impl GrowCtx {
         std::process::exit(0);
     }
 
+    /// 工具执行结果统一记入 grow.log（exit 码 + 非空 stdout/stderr）
+    fn log_output(&self, tool: &str, out: &std::process::Output) {
+        let code = out.status.code().unwrap_or(-1);
+        self.log(&format!("{tool} exit={code} (t={}s)", self.elapsed()));
+        for (label, data) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+            let s = String::from_utf8_lossy(data).trim().to_string();
+            if !s.is_empty() {
+                self.log(&format!("{tool} {label}: {s}"));
+            }
+        }
+    }
+
     /// 工具执行：stdout/stderr 记入 grow.log。None = spawn 失败（基础设施故障）
     fn run(&self, tool: &str, args: &[&str], stdin_data: Option<&str>) -> Option<i32> {
         let mut cmd = Command::new(tool);
@@ -769,33 +825,15 @@ impl GrowCtx {
             let _ = si.write_all(data.as_bytes());
         }
         let out = child.wait_with_output().ok()?;
-        let code = out.status.code().unwrap_or(-1);
-        self.log(&format!("{tool} exit={code} (t={}s)", self.elapsed()));
-        let so = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if !so.is_empty() {
-            self.log(&format!("{tool} stdout: {so}"));
-        }
-        if !se.is_empty() {
-            self.log(&format!("{tool} stderr: {se}"));
-        }
-        Some(code)
+        self.log_output(tool, &out);
+        Some(out.status.code().unwrap_or(-1))
     }
 
     /// 工具执行并返回 stdout（LVM 的 VG/LV 元数据发现）。None = spawn 失败
     fn run_capture(&self, tool: &str, args: &[&str]) -> Option<(i32, String)> {
         let out = Command::new(tool).args(args).output().ok()?;
-        let code = out.status.code().unwrap_or(-1);
-        self.log(&format!("{tool} exit={code} (t={}s)", self.elapsed()));
-        let so = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let se = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        if !so.is_empty() {
-            self.log(&format!("{tool} stdout: {so}"));
-        }
-        if !se.is_empty() {
-            self.log(&format!("{tool} stderr: {se}"));
-        }
-        Some((code, so))
+        self.log_output(tool, &out);
+        Some((out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).trim().to_string()))
     }
 
     /// 工具执行并归因：exit 0 返回继续；失败/无法 spawn 由闭包归因并终结
@@ -857,25 +895,25 @@ fn sysfs_part_size(disk_name: &str, part_num: u32) -> Option<u64> {
 /// 轮询 100ms×100 → 未达 → partx 兜底（节点缺失 -a / 尺寸不符 -u）→ 再轮询 → 仍未达 → false
 fn wait_partition_visible(ctx: &GrowCtx, part_num: u32, min_size: u64) -> bool {
     let check = |min: u64| sysfs_part_size(&ctx.disk_name, part_num).is_some_and(|s| s >= min);
-
-    for _ in 0..POLL_TRIES {
-        if check(min_size) {
-            return true;
+    let poll = |min: u64| {
+        for _ in 0..POLL_TRIES {
+            if check(min) {
+                return true;
+            }
+            std::thread::sleep(POLL_INTERVAL);
         }
-        std::thread::sleep(POLL_INTERVAL);
+        false
+    };
+
+    if poll(min_size) {
+        return true;
     }
     // 兜底：节点缺失 → partx -a（读盘添加缺失分区）；尺寸不符 → partx -u（更新已存在分区）
     let node_missing = sysfs_part_size(&ctx.disk_name, part_num).is_none();
     let mode = if node_missing { "-a" } else { "-u" };
     ctx.log(&format!("kernel reread incomplete, trying partx {mode}"));
     let _ = ctx.run(&tool_path(PARTX), &[mode, &ctx.disk], None);
-    for _ in 0..POLL_TRIES {
-        if check(min_size) {
-            return true;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    }
-    false
+    poll(min_size)
 }
 
 /// 读 GPT header（LBA1）字段：Some((last_usable_lba, (条目数, 条目尺寸)))
@@ -888,16 +926,19 @@ fn read_gpt_header(disk: &str, lba_bytes: u64) -> Option<(u64, (u32, u32))> {
     Some((le64(&lba1[48..56]), (le32(&lba1[80..84]), le32(&lba1[84..88]))))
 }
 
-/// backup header 是否已在设备末端标准位（relocate 成功/无需迁移的判据）
-/// 签名 + my_lba 双重校验（GPT 规范：my_lba @header+24 指向 header 自身）：
-/// 排除设备尾部残留旧 GPT 签名（my_lba 指向别处）造成的误判
-fn backup_header_at_end(disk: &str, device_sectors: u64) -> bool {
+/// backup header 是否已在设备末端标准位（relocate 成功/无需迁移的判据）。
+/// UEFI 规范：backup header 位于最后一个 LBA 起始处，my_lba（@header+24）
+/// 指向 header 自身——签名 + my_lba 双重校验，排除设备尾部残留旧 GPT
+/// 签名（my_lba 指向别处）造成的误判；偏移与 my_lba 均按 LBA 单位计算
+fn backup_header_at_end(disk: &str, device_sectors: u64, lba_bytes: u64) -> bool {
     let Ok(mut f) = File::open(disk) else { return false };
-    let mut tail = [0u8; 512];
-    let off = device_sectors.saturating_sub(1) * SECTOR;
-    read_at(&mut f, off, &mut tail) == 512
-        && &tail[0..8] == b"EFI PART"
-        && le64(&tail[24..32]) == device_sectors.saturating_sub(1)
+    let Some(device_bytes) = device_sectors.checked_mul(SECTOR) else { return false };
+    let Some(off) = device_bytes.checked_sub(lba_bytes) else { return false };
+    let last_lba = device_bytes / lba_bytes - 1;
+    let mut header = [0u8; 512];
+    read_at(&mut f, off, &mut header) == 512
+        && &header[0..8] == b"EFI PART"
+        && le64(&header[24..32]) == last_lba
 }
 
 /// 工具存在性检查集合：手术路径额外需要 sfdisk/mkswap/partx
@@ -973,13 +1014,25 @@ fn grow_mounted_fs(ctx: &GrowCtx, target: &str, spec: &MountedGrow) -> Result<()
     let _ = fs::create_dir_all(GROW_MNT);
     #[cfg(target_os = "linux")]
     {
-        use nix::mount::{MsFlags, mount, umount};
+        use nix::mount::{MsFlags, mount, umount, umount2, MntFlags};
         // 显式 turbofish：data=None 单独无法推断类型（与 init.rs 同模式）
-        if mount::<str, str, str, str>(Some(target), GROW_MNT, Some(spec.fstype), MsFlags::empty(), None).is_err() {
+        if mount::<str, str, str, str>(
+            Some(target),
+            GROW_MNT,
+            Some(spec.fstype),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+            None,
+        )
+        .is_err()
+        {
             return Err(spec.mount_err.into());
         }
         let grown = matches!(ctx.run(&tool_path(spec.tool), spec.args, None), Some(0));
-        let _ = umount(GROW_MNT);
+        // 残留挂载兜底：普通 umount 失败（如句柄未释放）→ lazy detach
+        if let Err(e) = umount(GROW_MNT) {
+            ctx.log(&format!("umount {GROW_MNT} failed: {e}, trying lazy detach"));
+            let _ = umount2(GROW_MNT, MntFlags::MNT_DETACH);
+        }
         if grown {
             return Ok(());
         }
@@ -1069,24 +1122,30 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     // 3) VG 内 LV 清单与受益者选择（与 part= 同构的声明式策略，不猜）：
     //    单 LV → 自动；多 LV → 必须命中 grow.conf `lv=` 声明，否则拒绝。
     //    默认 lvs 不加 -a，hidden 子卷（[tdata]/[tmeta]/_pmspare）不出现在
-    //    输出中（lvs(8)：internal LV 仅 -a 可见），等值匹配亦不会误选
-    let Some((code, lvs_out)) = ctx.run_capture(&tool_path(LVM), &["lvs", "--noheadings", "-o", "lv_name", &vg]) else {
+    //    输出中（lvs(8)：internal LV 仅 -a 可见），等值匹配亦不会误选；
+    //    thin pool 本体默认可见且 lv_attr 首字符为 't'（lvs(8) volume type）
+    let Some((code, lvs_out)) = ctx.run_capture(&tool_path(LVM), &["lvs", "--noheadings", "-o", "lv_name,lv_attr", &vg]) else {
         return Err("lvm spawn failed".into());
     };
     if code != 0 {
         return Err(format!("lvs failed (exit {code})"));
     }
-    let lv_names: Vec<String> =
-        lvs_out.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
-    let lv = match &lv_names[..] {
-        [only] => only.clone(),
+    let lv_list: Vec<(String, String)> = lvs_out
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            Some((f.next()?.to_string(), f.next().unwrap_or("").to_string()))
+        })
+        .collect();
+    let lv = match lv_list.len() {
+        1 => lv_list[0].0.clone(),
         _ => match &ctx.lv_declared {
-            Some(declared) if lv_names.iter().any(|n| n == declared) => declared.clone(),
+            Some(declared) if lv_list.iter().any(|(n, _)| n == declared) => declared.clone(),
             _ => {
                 return Err(format!(
                     "volume group {vg} has {} logical volumes; declare one via grow.conf 'lv=<name>' (found: {})",
-                    lv_names.len(),
-                    lv_names.join(", ")
+                    lv_list.len(),
+                    lv_list.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
                 ))
             }
         },
@@ -1105,6 +1164,13 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
         Some(0) => {}
         Some(c) => return Err(format!("lvextend failed (exit {c})")),
         None => return Err("lvm spawn failed".into()),
+    }
+
+    // thin pool（lv_attr 首字符 't'）：lvextend 扩池数据区即达成目标，
+    // pool dm 设备无文件系统可扩——跳过激活/dm 解析/fs 递归，避免恒 Partial 假失败
+    if lv_list.iter().any(|(n, a)| n == &lv && a.starts_with('t')) {
+        ctx.log("thin pool data area extended (no fs resize needed)");
+        return Ok(());
     }
 
     // 6) 解析 dm 设备节点（/dev/<vg>/<lv> 是 udev 符号链接，此处不存在；
@@ -1149,7 +1215,6 @@ pub fn run_grow(disk: &str) -> ! {
     let Some(geom) = DiskGeometry::read(&ctx.disk_name) else {
         ctx.finish(Status::Failed, "cannot read device size", "", 0, 0);
     };
-    let tolerance = align_tolerance(&ctx.disk_name);
 
     let plan = analyze_with(Path::new(disk), &ctx.disk_name, geom.device_sectors, geom.lba_bytes, &policy);
     let Some(action) = plan.action else {
@@ -1185,7 +1250,7 @@ pub fn run_grow(disk: &str) -> ! {
                     _ => {
                         // relocate 失败归因（它是 GPT metadata 写操作，纳入"持久变更"原则）：
                         // 证实 backup 仍在原位（未持久变更）→ Skipped；状态无法证实 → Failed
-                        if backup_header_at_end(&ctx.disk, geom.device_sectors) {
+                        if backup_header_at_end(&ctx.disk, geom.device_sectors, geom.lba_bytes) {
                             // 已在标准位（本就无需迁移）→ 继续
                         } else if read_gpt_header(&ctx.disk, geom.lba_bytes).is_some() {
                             // backup 可能被半迁移（relocate 中途失败）→ 附幂等修复命令
@@ -1201,8 +1266,9 @@ pub fn run_grow(disk: &str) -> ! {
                 }
             }
 
+            let old_bytes = old_sectors * SECTOR;
             if let Some(s) = surgery {
-                grow_with_surgery(&ctx, &geom, is_gpt, &s, &part_dev, fs, old_sectors);
+                grow_with_surgery(&ctx, &geom, is_gpt, &s, &part_dev, fs, old_bytes);
             } else {
                 // 非手术：`, +`（start/type/UUID 全保留）。前置不变量：分析层已证明
                 // target 是 end-LBA 最大可扩分区且其后无障碍——安全边界全在分析层
@@ -1215,7 +1281,7 @@ pub fn run_grow(disk: &str) -> ! {
                         // GPT relocate 已提交 mutation → 不得降级 Skipped；MBR 未变更 → Skipped
                         let reason = format!("sfdisk partition grow failed (exit {c})");
                         if is_gpt {
-                            ctx.finish(Status::Partial, &reason, "", old_sectors * SECTOR, 0);
+                            ctx.finish(Status::Partial, &reason, "", old_bytes, 0);
                         } else {
                             ctx.finish(Status::Skipped, &reason, "", 0, 0);
                         }
@@ -1224,7 +1290,9 @@ pub fn run_grow(disk: &str) -> ! {
                 );
 
                 write_phase("kernel-reread");
-                // /sys 比对消费分析层的 expected 值；扣 `, +` 对齐容差（sfdisk 对齐粒度，自适应）
+                // /sys 比对消费分析层的 expected 值；扣 `, +` 对齐容差（sfdisk 对齐粒度，自适应）。
+                // 仅非手术路径消费容差——superfloppy / 手术路径不读
+                let tolerance = align_tolerance(&ctx.disk_name);
                 let expected = expected_new_sectors;
                 let min_size = expected.saturating_sub(tolerance);
                 // 期望值未超过旧尺寸（对齐后无增长空间）→ 已是目标态，无需等待内核同步
@@ -1232,17 +1300,17 @@ pub fn run_grow(disk: &str) -> ! {
                     // 与手术路径同档归档：分区表已持久扩容（sfdisk exit 0 已过），
                     // 卡点在内核同步 → Failed + fs 手动命令（重启后内核重读即扩，补 fs 即完成）
                     let manual = manual_cmd_for_fs(fs, &part_dev);
-                    ctx.finish(Status::Failed, "kernel partition reread failed", &manual, old_sectors * SECTOR, 0);
+                    ctx.finish(Status::Failed, "kernel partition reread failed", &manual, old_bytes, 0);
                 }
 
                 write_phase("filesystem");
                 let new_sectors = sysfs_part_size(&ctx.disk_name, part_num).unwrap_or(old_sectors);
                 match resize_fs(&ctx, fs, &part_dev) {
-                    Ok(()) => ctx.finish(Status::Expanded, "", "", old_sectors * SECTOR, new_sectors * SECTOR),
+                    Ok(()) => ctx.finish(Status::Expanded, "", "", old_bytes, new_sectors * SECTOR),
                     // 持久分区表变更已发生 → 不得降级 Skipped
                     Err(reason) => {
                         let manual = manual_cmd_for_fs(fs, &part_dev);
-                        ctx.finish(Status::Partial, &format!("partition expanded; filesystem resize failed ({reason})"), &manual, old_sectors * SECTOR, new_sectors * SECTOR);
+                        ctx.finish(Status::Partial, &format!("partition expanded; filesystem resize failed ({reason})"), &manual, old_bytes, new_sectors * SECTOR);
                     }
                 }
             }
@@ -1273,13 +1341,14 @@ fn grow_with_surgery(
     s: &SurgeryPlan,
     root_dev: &str,
     fs: FsKind,
-    old_root_sectors: u64,
+    old_root_bytes: u64,
 ) -> ! {
     let swap_dev = format!("/dev/{}", part_dev_name(&ctx.disk_name, s.swap_num));
     let lba = geom.lba_bytes;
 
-    // 手术精确算术：relocate 后重读 header 拿真实 last_usable_lba
-    // （dd 后盘上该字段是镜像旧尺寸的过期值——顺序依赖，文档第 5 步）
+    // 手术精确算术：last_usable_lba 在 dd 后是镜像旧尺寸的过期值，
+    // 必须 relocate 后重读（顺序依赖）；重读值异常偏小时回绕会产生
+    // 天文数字 LBA，checked 减法显式终结
     let usable_last = if is_gpt {
         match read_gpt_header(&ctx.disk, lba) {
             Some((last_usable, _)) => last_usable,
@@ -1287,17 +1356,30 @@ fn grow_with_surgery(
         }
     } else {
         // MBR 32-bit LBA 上限；device_sectors 是 sysfs 512B 单位，先换算为 LBA
-        (geom.device_sectors * SECTOR / lba).min(1u64 << 32) - 1
+        sysfs_to_lba(geom.device_sectors, lba).min(1u64 << 32) - 1
     };
-    let new_swap_start = usable_last - s.swap_sectors + 1;
-    let root_new_size = new_swap_start - s.root_first_lba;
+    // S0 未动盘：算术异常属分析层前提失效 → Skipped（非 Failed）
+    let Some(new_swap_start) = s.swap_sectors.checked_sub(1).and_then(|n| usable_last.checked_sub(n))
+    else {
+        ctx.finish(Status::Skipped, "surgery plan arithmetic underflow (abnormal last usable lba)", "", 0, 0);
+    };
+    let Some(root_new_size) = new_swap_start.checked_sub(s.root_first_lba) else {
+        ctx.finish(Status::Skipped, "surgery plan arithmetic underflow (root start)", "", 0, 0);
+    };
+    let new_root_bytes = root_new_size.saturating_mul(lba);
 
     // 手动恢复命令（按失败档位生成；分析层已持有全部原值）
     let mkswap_cmd = |dev: &str| {
+        // label 是盘上可控字节，manual_cmd 面向用户复制粘贴：白名单过滤防注入
         let label = if s.swap_label.is_empty() {
             String::new()
         } else {
-            format!(" -L {}", s.swap_label)
+            let safe: String = s
+                .swap_label
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '_' })
+                .collect();
+            format!(" -L {safe}")
         };
         format!("mkswap -U {}{label} {dev}", s.swap_uuid)
     };
@@ -1306,23 +1388,28 @@ fn grow_with_surgery(
             cmd.push_str(&format!("; sfdisk --part-uuid {} {} {}", ctx.disk, s.swap_num, pu));
         }
     };
-    // S1→S2 失败：swap 已删未重建 → sfdisk 原位重建 + PARTUUID + mkswap 组合
-    let manual_s2 = {
+    // swap 重建组合命令（两失败档共用，仅起始 LBA 不同：原位 / 新尾部位置）
+    let mkswap_recreate = |start: u64| {
         let mut c = format!(
             "printf '{}, {}, type={}' | sfdisk -N {} {}",
-            s.swap_first_lba, s.swap_sectors, s.swap_ptype, s.swap_num, ctx.disk
+            start, s.swap_sectors, s.swap_ptype, s.swap_num, ctx.disk
         );
         restore_partuuid(&mut c);
         c.push_str("; ");
         c.push_str(&mkswap_cmd(&swap_dev));
         c
     };
+    // S1→S2 失败：swap 已删未重建 → sfdisk 原位重建 + PARTUUID + mkswap 组合
+    let manual_s2 = mkswap_recreate(s.swap_first_lba);
     // S2→S3 及以后：分区已重建 → mkswap 全参（+ GPT PARTUUID）
     let manual_s3 = {
         let mut c = mkswap_cmd(&swap_dev);
         restore_partuuid(&mut c);
         c
     };
+    // S2→S3 失败档：swap 分区未重建，mkswap 对不存在的节点必失败——
+    // manual 必须含分区重建步骤（新位置 + 原有 type/UUID/PARTUUID 全值）
+    let manual_s3_pre = mkswap_recreate(new_swap_start);
     let manual_s4 = manual_cmd_for_fs(fs, root_dev);
 
     // S0 → S1：删除 swap（失败 = 未动盘 → Skipped）
@@ -1361,11 +1448,11 @@ fn grow_with_surgery(
         |c| ctx.finish(
             Status::Partial,
             &format!("target expanded; swap missing (recreate exit {c})"),
-            &manual_s3,
-            old_root_sectors * SECTOR,
+            &manual_s3_pre,
+            old_root_bytes,
             0,
         ),
-        || ctx.finish(Status::Failed, "sfdisk spawn failed", &manual_s3, old_root_sectors * SECTOR, 0),
+        || ctx.finish(Status::Failed, "sfdisk spawn failed", &manual_s3_pre, old_root_bytes, 0),
     );
     ctx.log("surgery S3: swap partition rebuilt");
 
@@ -1379,14 +1466,14 @@ fn grow_with_surgery(
                 Status::Partial,
                 "target expanded; swap recreation incomplete (part-uuid restore failed)",
                 &manual_s3,
-                old_root_sectors * SECTOR,
+                old_root_bytes,
                 0,
             ),
             || ctx.finish(
                 Status::Partial,
                 "target expanded; swap recreation incomplete (part-uuid restore failed)",
                 &manual_s3,
-                old_root_sectors * SECTOR,
+                old_root_bytes,
                 0,
             ),
         );
@@ -1394,10 +1481,10 @@ fn grow_with_surgery(
 
     // 内核同步最终判据：/sys 实际尺寸（root 精确值 + swap 精确值，LBA→sysfs 512B 扇区换算）
     write_phase("kernel-reread");
-    if !wait_partition_visible(ctx, s.root_num, root_new_size * lba / SECTOR)
-        || !wait_partition_visible(ctx, s.swap_num, s.swap_sectors * lba / SECTOR)
+    if !wait_partition_visible(ctx, s.root_num, lba_to_sysfs(root_new_size, lba))
+        || !wait_partition_visible(ctx, s.swap_num, lba_to_sysfs(s.swap_sectors, lba))
     {
-        ctx.finish(Status::Failed, "kernel partition reread failed", &manual_s3, old_root_sectors * SECTOR, 0);
+        ctx.finish(Status::Failed, "kernel partition reread failed", &manual_s3, old_root_bytes, 0);
     }
 
     // fs UUID 恢复（失败归 S3→S4 档）
@@ -1418,23 +1505,23 @@ fn grow_with_surgery(
             Status::Partial,
             &format!("target expanded; swap recreation incomplete (mkswap exit {c})"),
             &manual_s3,
-            old_root_sectors * SECTOR,
-            root_new_size * lba,
+            old_root_bytes,
+            new_root_bytes,
         ),
-        || ctx.finish(Status::Failed, "mkswap spawn failed", &manual_s3, old_root_sectors * SECTOR, 0),
+        || ctx.finish(Status::Failed, "mkswap spawn failed", &manual_s3, old_root_bytes, 0),
     );
     ctx.log("surgery S3 complete: swap UUID/label restored");
 
     // S3 → S4：fs 扩容
     write_phase("filesystem");
     match resize_fs(ctx, fs, root_dev) {
-        Ok(()) => ctx.finish(Status::Expanded, "", "", old_root_sectors * SECTOR, root_new_size * lba),
+        Ok(()) => ctx.finish(Status::Expanded, "", "", old_root_bytes, new_root_bytes),
         Err(reason) => ctx.finish(
             Status::Partial,
             &format!("swap rebuilt; fs resize failed ({reason})"),
             &manual_s4,
-            old_root_sectors * SECTOR,
-            root_new_size * lba,
+            old_root_bytes,
+            new_root_bytes,
         ),
     }
 }
