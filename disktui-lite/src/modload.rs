@@ -3,8 +3,8 @@
 //!
 //! 前提（由模板构建与 /etc/modules 清单保证）：
 //! - 模块以裸 .ko 文件存在（未压缩），条目路径相对模块目录根
-//! - 不处理 alias / options / modules.softdep；有加载顺序要求的依赖
-//!   （如 crc32c 先于 xfs/btrfs）由清单显式排序
+//! - 不处理 alias / options；符号依赖由 modules.dep 覆盖并自动按序加载，
+//!   softdep（如 libcrc32c 的 pre: crc32c）不在依赖表中，需清单显式前置
 //! - 模块名即 .ko 文件名 stem；`-` 与 `_` 等价（内核侧 canonical 为下划线）
 
 use std::collections::{HashMap, HashSet};
@@ -81,16 +81,14 @@ impl ModuleLoader {
         Ok(())
     }
 
-    /// 依赖表以 canonical 名（下划线）为键
+    /// 依赖表以 canonical 名为键，直接按 canonical 查询
     fn lookup_stem(&self, name: &str) -> Result<String, String> {
-        if self.map.contains_key(name) {
-            return Ok(name.to_string());
+        let stem = canonical(name);
+        if self.map.contains_key(&stem) {
+            Ok(stem)
+        } else {
+            Err(format!("'{name}' not in modules.dep"))
         }
-        let canonical = canonical(name);
-        if self.map.contains_key(&canonical) {
-            return Ok(canonical);
-        }
-        Err(format!("'{name}' not in modules.dep"))
     }
 
     fn loaded(&self, name: &str) -> bool {
