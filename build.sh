@@ -49,8 +49,9 @@ SIGNED_PKGS="${KERNEL_PKG},${GRUB_PKG}"
 
 # --- grow：fs 内核模块按 GROW_TOOLS 条目注入（必须在 REQUIRED_MODULES 计算前）---
 # xfs/btrfs 在线扩容需 mount（内核驱动）；lvm 需 device-mapper
-# crc32c_generic 前置于 xfs/btrfs：libcrc32c 有 softdep(pre: crc32c)，busybox modprobe
-# 不解析 modules.softdep，不显式先载则 libcrc32c init 时找不到 "crc32c" 算法而失败
+# crc32c_generic 前置于 xfs/btrfs：libcrc32c 有 softdep(pre: crc32c)，内置
+# 模块加载器与 modprobe 同样不解析 modules.softdep，不显式先载则
+# libcrc32c init 时找不到 "crc32c" 算法而失败
 if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs; then
         MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic xfs"
@@ -269,9 +270,6 @@ if [[ "${ENABLE_SECURE_BOOT:-0}" == "1" ]]; then
     [[ -n "${SHIM_SRC}" ]] || die "rootfs 中未找到 shim"
 fi
 
-command -v busybox &>/dev/null || die "未找到 busybox，请安装 busybox-static 包"
-echo "  BusyBox $(busybox --help 2>&1 | head -1 | awk '{print $NF}')"
-
 rm -rf "${ROOTFS_DIR}/var/lib/apt/lists"/* \
        "${ROOTFS_DIR}/var/cache/apt"/*
 echo "  Phase 2 完成。"
@@ -288,11 +286,8 @@ mkdir -p "${INITRAMFS_DIR}"/{media/cdrom,image,var/log,root}
 mkdir -p "${INITRAMFS_DIR}"/{dev/pts,dev/shm}
 
 if [[ "${USE_TUI}" == "1" ]]; then
-    ARCH_DIR="${ARCH^^}"
-    cp "${SCRIPT_DIR}/binaries/${ARCH_DIR}/busybox_MODPROBE"  "${INITRAMFS_DIR}/sbin/modprobe"
-    cp "${SCRIPT_DIR}/binaries/${ARCH_DIR}/busybox_MOUNT"     "${INITRAMFS_DIR}/bin/mount"
-    chmod +x "${INITRAMFS_DIR}/sbin/modprobe" "${INITRAMFS_DIR}/bin/mount"
-
+    # initramfs 用户态仅 disktui-lite；内核模块由其内置加载器
+    # （modules.dep + finit_module）加载
     [[ -f "${SCRIPT_DIR}/binaries/disktui-lite" ]] || die "找不到 disktui-lite，请先构建"
     cp "${SCRIPT_DIR}/binaries/disktui-lite" "${INITRAMFS_DIR}/usr/bin/disktui-lite"
     chmod +x "${INITRAMFS_DIR}/usr/bin/disktui-lite"

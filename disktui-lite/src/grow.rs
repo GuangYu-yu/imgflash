@@ -680,6 +680,12 @@ fn tool_path(name: &str) -> String {
     format!("{BOOT_MEDIA_DIR}/{GROW_TOOLS_DIR}/{name}")
 }
 
+/// 按需加载单个内核模块（xfs/btrfs/dm-mod 场景的防御纵深）
+#[cfg(target_os = "linux")]
+fn ensure_kernel_module(name: &str) -> Result<(), String> {
+    crate::modload::ModuleLoader::new().and_then(|l| l.load(name))
+}
+
 /// 原子写（write-to-tmp + rename，同 /run tmpfs 内 rename 原子），
 /// 杜绝 TUI 读到 truncate 后的空帧/半帧
 fn atomic_write(path: &str, content: &str) {
@@ -1005,12 +1011,17 @@ const BTRFS_GROW: MountedGrow = MountedGrow {
     grow_err: "btrfs filesystem resize failed",
 };
 
-/// 在线扩容共享路径：modprobe 防御 → 挂载 → 工具执行 → 卸载。
+/// 在线扩容共享路径：模块加载防御 → 挂载 → 工具执行 → 卸载。
 /// spec 携带 fstype/module/工具命令与归因文案；mount 失败即 Err（fs 支持缺失）。
 fn grow_mounted_fs(ctx: &GrowCtx, target: &str, spec: &MountedGrow) -> Result<(), String> {
     // 防御纵深：boot 期模块列表通常已加载 fstype，此处不依赖该隐式前提；
-    // 不检查返回值，mount 失败自然兜底归因
-    let _ = Command::new("modprobe").arg(spec.module).status();
+    // 失败记入 grow.log，mount 失败自然兜底归因
+    #[cfg(target_os = "linux")]
+    if let Err(e) = ensure_kernel_module(spec.module) {
+        ctx.log(&format!("module {}: {}", spec.module, e));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (ctx, spec);
     let _ = fs::create_dir_all(GROW_MNT);
     #[cfg(target_os = "linux")]
     {
@@ -1095,7 +1106,12 @@ fn resize_fs(ctx: &GrowCtx, fs: FsKind, target: &str) -> Result<(), String> {
 /// 对 dm 设备 sniff 后递归 fs 扩容。
 /// 递归深度有界：LV 上只可能是 ext/xfs/btrfs（再嵌套 LVM 的病态布局不支持）
 fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
-    let _ = Command::new("modprobe").arg("dm-mod").status();
+    #[cfg(target_os = "linux")]
+    if let Err(e) = ensure_kernel_module("dm-mod") {
+        ctx.log(&format!("module dm-mod: {e}"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = ctx;
     // 静态 lvm 的运行时目录（锁文件/扫描缓存；无 udev 环境不自建则命令失败）
     let _ = fs::create_dir_all("/run/lvm");
     let _ = fs::create_dir_all("/run/lock/lvm");

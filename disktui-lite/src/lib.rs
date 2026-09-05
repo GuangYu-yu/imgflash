@@ -4,6 +4,8 @@ pub mod grow;
 pub mod handler;
 #[cfg(target_os = "linux")]
 pub mod init;
+#[cfg(target_os = "linux")]
+pub mod modload;
 pub mod notification;
 pub mod theme;
 pub mod tui;

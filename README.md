@@ -68,7 +68,7 @@ ISO 中同时存在三处 GRUB 相关文件，分工如下：
 | 界面 | 终端 TUI，键盘导航 | 纯文本菜单，数字选择 |
 | 确认 | 方向键选择 Yes/No | 输入大写 `YES` |
 | 进度条 | 实时进度条 + 速度 + ETA | 文字进度 + 速度 |
-| BusyBox | 预编译独立 applet（`binaries/<ARCH>/busybox_MODPROBE`、`busybox_MOUNT`） | 系统 `busybox-static` |
+| BusyBox | 无（内核模块由内置 Rust 加载器 modload 加载） | 系统 `busybox-static` |
 | 配置 | `USE_TUI=1` | `USE_TUI=0` |
 
 ## 构建流程
@@ -206,7 +206,9 @@ cd ..
 
 工作流：[`.github/workflows/update-binaries.yml`](.github/workflows/update-binaries.yml)
 
-为 TUI 模式独立编译 `busybox_MODPROBE` / `busybox_MOUNT` 静态 applet（musl 工具链），并提交到 `binaries/AMD64/` 与 `binaries/ARM64/`：
+独立编译 `busybox_MODPROBE` 静态 applet（musl 工具链）提交到 `binaries/<ARCH>/`。
+注：TUI initramfs 已内置 Rust 模块加载器（modload），不再打入任何 busybox applet；
+此工作流产物仅作备用保留：
 - 留空版本号自动检测最新版
 - 指定版本号则使用手动值
 
