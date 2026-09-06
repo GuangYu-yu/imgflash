@@ -124,7 +124,7 @@ impl ModuleLoader {
         let stem = canonical(name);
         if self.map.contains_key(&stem) {
             Ok(stem)
-        } else if self.loaded_or_builtin(&name) {
+        } else if self.loaded_or_builtin(name) {
             // 枚举名是内建模块（=y，编译进内核）或已在 sysfs 出现：
             // 无需 .ko 加载，视为已满足。
             Ok(stem)
