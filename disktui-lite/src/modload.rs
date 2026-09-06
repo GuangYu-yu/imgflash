@@ -117,9 +117,19 @@ impl ModuleLoader {
         let stem = canonical(name);
         if self.map.contains_key(&stem) {
             Ok(stem)
+        } else if self.loaded_or_builtin(&name) {
+            // 枚举名是内建模块（=y，编译进内核）或已在 sysfs 出现：
+            // 无需 .ko 加载，视为已满足。
+            Ok(stem)
         } else {
             Err(format!("'{name}' not in modules.dep"))
         }
+    }
+
+    /// 模块是否已在 sysfs 可见（内建 =y 或已加载的模块均有 /sys/module/<name>）。
+    /// 内建模块没有 .ko / modules.dep 条目，但内核已带；此分支让枚举更健壮。
+    fn loaded_or_builtin(&self, name: &str) -> bool {
+        Path::new("/sys/module").join(canonical(name)).exists()
     }
 
     fn loaded(&self, name: &str) -> bool {

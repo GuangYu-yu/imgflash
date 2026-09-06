@@ -311,7 +311,7 @@ if [[ "${USE_TUI}" == "1" ]]; then
 #     chmod +x "${INITRAMFS_DIR}/usr/bin/installer"
 fi
 
-echo "${REQUIRED_MODULES}" | tr ' ' '\n' > "${INITRAMFS_DIR}/etc/modules"
+# /etc/modules 生成下移到 BOOT_FILES 闭包计算之后，用实际存在的内核模块 stem
 
 echo "  精简内核模块 ..."
 MOD_SRC="${ROOTFS_DIR}/lib/modules/${KVER}"
@@ -343,6 +343,16 @@ done
 for f in modules.builtin modules.builtin.modinfo; do
     [ -f "${MOD_SRC}/$f" ] && cp "${MOD_SRC}/$f" "${MOD_DEST}/"
 done
+
+# /etc/modules = boot 闭包实际存在的 .ko stem（相对 MOD_SRC 的路径 basename 去 .ko）。
+# 依赖闭包已含全部传递依赖；内建 =y 模块无 .ko、不在 BOOT_FILES，自然剔除。
+echo "$BOOT_FILES" | tr ' ' '\n' | while read -r m; do
+    [ -z "$m" ] && continue
+    base="${m##*/}"      # basename：foo.ko.xz
+    base="${base%.xz}"   # foo.ko （剥压缩后缀）
+    base="${base%.ko}"   # foo   （剥模块后缀）
+    echo "$base"
+done | sort -u > "${INITRAMFS_DIR}/etc/modules"
 
 # grow 专用模块闭包 → 暂存，Phase5 注入 ISO /grow/modules/<ver>/（不进 initrd）
 GROW_TREE="${BUILD_DIR}/grow-modules"
