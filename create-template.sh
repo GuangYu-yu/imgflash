@@ -261,7 +261,24 @@ done
 # grow 专用模块闭包 → 暂存，Phase4 注入模板 ISO /grow/modules/<ver>/（不进 initrd）
 GROW_TREE="${BUILD_DIR}/grow-modules"
 if [[ -n "${GROW_MODULES}" ]]; then
+    GROW_TREE_VER="${GROW_TREE}/${KVER}"
+    mkdir -p "${GROW_TREE_VER}/.manifest"
     GROW_FILES=""
+    # 逐 fs 独立闭包 → manifest 清单（相对 /grow/modules/<ver> 的 .ko 路径，每行一个）。
+    # fast path 按其 GROW_TOOLS 并集各 fs manifest 保留、剔除其余，故共享依赖天然正确。
+    # fs→内核模块名映射：xfs/btrfs 为 fs 名同名；lvm 用 device-mapper
+    grow_fs_manifest() {
+        local fs="$1" mod="$2" list="$GROW_TREE_VER/.manifest/$fs"
+        : > "$list"
+        while IFS= read -r mod_file; do
+            [ -z "$mod_file" ] && continue
+            echo "$(echo "$mod_file" | sed "s|${MOD_SRC}/||")" >> "$list"
+        done < <(modprobe -d "${ROOTFS_DIR}" -S "${KVER}" --show-depends "$mod" 2>/dev/null | awk '/^insmod/ {print $2}')
+    }
+    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs  && grow_fs_manifest xfs  xfs
+    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs && grow_fs_manifest btrfs btrfs
+    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm   && grow_fs_manifest lvm   dm-mod
+
     for mod in ${GROW_MODULES}; do
         deps=$(modprobe -d "${ROOTFS_DIR}" -S "${KVER}" --show-depends "$mod" 2>/dev/null \
             | awk '/^insmod/ {print $2}')
@@ -271,7 +288,7 @@ if [[ -n "${GROW_MODULES}" ]]; then
     echo "  grow 模块：$(echo "$GROW_FILES" | wc -l) 个（含依赖，入模板 ISO /grow/modules/）"
     for mod_file in $GROW_FILES; do
         rel_path=$(echo "$mod_file" | sed "s|${MOD_SRC}/||")
-        dest_dir="${GROW_TREE}/${KVER}/$(dirname "$rel_path")"
+        dest_dir="${GROW_TREE_VER}/$(dirname "$rel_path")"
         mkdir -p "$dest_dir"
         xz -dc "$mod_file" > "${dest_dir}/$(basename "${rel_path%.xz}")"
     done

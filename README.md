@@ -279,7 +279,7 @@ dd 写入成功后，安装器自动将目标盘尾部空闲空间分配给可�
     *   Swap 是最后一个分区，且前一个分区不可扩展（如 FAT）。
 *   **逃生门**：内核参数 `grow=off` 可在运行期强制禁用。
 *   **架构**：工具 + `grow.conf` 住 ISO `/grow/`；**LICENSES.txt 位于 `binaries/<ARCH>/grow/`**，作为随 Release 发布的源提供物，不注入 ISO。
-*   **架构**：initramfs 仅含 boot 必需内核模块闭包（存储/光驱/iso9660/squashfs/loop）；grow 专用内核模块（xfs/btrfs/dm-mod）随模板固化在 ISO `/grow/modules/<ver>/`，运行期由 modload 双根搜索（initrd miss → ISO）按需加载，工具版本与模板内核同源解耦。
+*   **架构**：initramfs 仅含 boot 必需内核模块闭包（存储/光驱/iso9660/squashfs/loop）；grow 专用内核模块（xfs/btrfs/dm-mod）随模板固化在 ISO `/grow/modules/<ver>/` 作同源来源，fast path 依据 `GROW_TOOLS` 白名单裁剪后注入最终 ISO `/grow/modules/`（仅含实际选用的 fs 模块），运行期由 modload 双根搜索（initrd miss → ISO）按需加载，工具版本与模板内核同源解耦。
 
 安装结果屏会显示一行扩容状态（Expanded / Skipped / Partial / Failed）；Partial 状态附自包含的手动恢复命令（重启后 `/run` 数据即失）。
 

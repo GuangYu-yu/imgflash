@@ -272,6 +272,43 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
 
     GROW_MAP_ARGS=(-map "${GROW_STAGE}" /grow)
 
+    # --- grow 内核模块：模板带全量作源，此处按 GROW_TOOLS 裁剪后注入 ---
+    # 模板 /grow/modules/<ver>/ 含全量 grow 模块 .ko + 逐 fs .manifest 闭包清单。
+    # fast path 无需模块源/modprobe，直接读清单做白名单拷贝：只复制 GROW_TOOLS
+    # 涉及 fs 的清单并集，其余 .ko 与 .manifest 一并丢弃。裁剪在本地文件系统完成，
+    # boot 元数据由主命令 -boot_image any replay 保留，不受文件树删除影响。
+    GROW_MOD_STAGE=""
+    if [[ "${GROW_ENABLED:-0}" == "1" ]] && command -v xorriso >/dev/null; then
+        MOD_SRC_X="${BUILD_DIR}/grow-modules-src"
+        Gkeep="${BUILD_DIR}/grow.keep"
+        CLEAN_X="${BUILD_DIR}/grow-modules-clean"
+        rm -rf "${MOD_SRC_X}" "${Gkeep}" "${CLEAN_X}"
+        mkdir -p "${CLEAN_X}"
+        xorriso -osirrox on -indev "${TEMPLATE_PATH}" \
+            -extract /grow/modules "${MOD_SRC_X}" >/dev/null 2>&1
+        VER_DIR=$(find "${MOD_SRC_X}" -mindepth 1 -maxdepth 1 -type d | head -1)
+        VER_NAME=$(basename "${VER_DIR}")
+        if [[ -n "${VER_NAME}" && -d "${VER_DIR}/.manifest" ]]; then
+            : > "${Gkeep}"
+            for fs in xfs btrfs lvm; do
+                if grow_tool_enabled "${fs}"; then
+                    L="${VER_DIR}/.manifest/${fs}"
+                    [[ -f "${L}" ]] && grep -v '^$' "${L}" >> "${Gkeep}"
+                fi
+            done
+            # 白名单拷贝：清单内相对路径（相对 <ver>）逐一复制，保持 <ver> 结构
+            while IFS= read -r rel; do
+                src="${VER_DIR}/${rel}"
+                [[ -f "${src}" ]] || continue
+                dst="${CLEAN_X}/${VER_NAME}/${rel}"
+                mkdir -p "$(dirname "${dst}")"
+                cp "${src}" "${dst}"
+            done < "${Gkeep}"
+            GROW_MOD_STAGE="${CLEAN_X}"
+        fi
+        rm -rf "${MOD_SRC_X}" "${Gkeep}"
+    fi
+
     # 粗粒度 fail-fast：覆盖值必须真实存在（sfdisk 对镜像文件可用）
     if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then
         sfdisk -d "${IMAGE_PATH}" 2>/dev/null | grep -q "image.img${GROW_PART} :" \
@@ -279,10 +316,16 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     fi
 fi
 
+GROW_MOD_ARGS=()
+if [[ -n "${GROW_MOD_STAGE}" && -d "${GROW_MOD_STAGE}" ]]; then
+    GROW_MOD_ARGS=(-rm_r /grow/modules -map "${GROW_MOD_STAGE}" /grow/modules)
+fi
+
 xorriso -indev "${TEMPLATE_PATH}" \
     -outdev "${FINAL_ISO}" \
     -map "${BUILD_DIR}/image.squashfs" /image.squashfs \
     "${GROW_MAP_ARGS[@]}" \
+    "${GROW_MOD_ARGS[@]}" \
     -volid "${VOLUME_LABEL}" \
     -boot_image any replay \
     -commit
