@@ -277,7 +277,7 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     # fast path 无需模块源/modprobe，直接读清单做白名单拷贝：只复制 GROW_TOOLS
     # 涉及 fs 的清单并集，其余 .ko 与 .manifest 一并丢弃。裁剪在本地文件系统完成，
     # boot 元数据由主命令 -boot_image any replay 保留，不受文件树删除影响。
-    GROW_MOD_STAGE=""
+    GROW_MOD_STAGE=""   # set -u 安全网：先定义空，GROW_ENABLED 已含或未命中则保持空
     if [[ "${GROW_ENABLED:-0}" == "1" ]] && command -v xorriso >/dev/null; then
         MOD_SRC_X="${BUILD_DIR}/grow-modules-src"
         Gkeep="${BUILD_DIR}/grow.keep"

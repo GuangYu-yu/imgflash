@@ -266,18 +266,17 @@ if [[ -n "${GROW_MODULES}" ]]; then
     GROW_FILES=""
     # 逐 fs 独立闭包 → manifest 清单（相对 /grow/modules/<ver> 的 .ko 路径，每行一个）。
     # fast path 按其 GROW_TOOLS 并集各 fs manifest 保留、剔除其余，故共享依赖天然正确。
-    # fs→内核模块名映射：xfs/btrfs 为 fs 名同名；lvm 用 device-mapper
-    grow_fs_manifest() {
-        local fs="$1" mod="$2" list="$GROW_TREE_VER/.manifest/$fs"
+    grow_manifest() {
+        local mod="$1" list="$2"
         : > "$list"
         while IFS= read -r mod_file; do
             [ -z "$mod_file" ] && continue
             echo "$(echo "$mod_file" | sed "s|${MOD_SRC}/||")" >> "$list"
         done < <(modprobe -d "${ROOTFS_DIR}" -S "${KVER}" --show-depends "$mod" 2>/dev/null | awk '/^insmod/ {print $2}')
     }
-    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs  && grow_fs_manifest xfs  xfs
-    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs && grow_fs_manifest btrfs btrfs
-    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm   && grow_fs_manifest lvm   dm-mod
+    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs  && grow_manifest xfs  "${GROW_TREE_VER}/.manifest/xfs"
+    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs && grow_manifest btrfs "${GROW_TREE_VER}/.manifest/btrfs"
+    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm   && grow_manifest dm-mod "${GROW_TREE_VER}/.manifest/lvm"
 
     for mod in ${GROW_MODULES}; do
         deps=$(modprobe -d "${ROOTFS_DIR}" -S "${KVER}" --show-depends "$mod" 2>/dev/null \
