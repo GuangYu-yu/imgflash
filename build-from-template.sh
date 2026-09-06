@@ -305,8 +305,13 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
                 cp "${src}" "${dst}"
             done < "${Gkeep}"
             # 保留 grow 树 modules.dep（grow 依赖解析依赖它；多余 fs 条目无害，modload 只加载实际调用模块）
-            [[ -f "${VER_DIR}/modules.dep" ]] && cp "${VER_DIR}/modules.dep" "${CLEAN_X}/${VER_NAME}/modules.dep"
-            GROW_MOD_STAGE="${CLEAN_X}"
+            if [[ -n "$(cat "${Gkeep}" 2>/dev/null)" ]]; then
+                # 仅当裁剪后有模块保留时才 map：纯用户态 fs（ext4/ntfs 无内核模块）时 grow 树应为空，
+                # 此时不 map，避免空目录注入
+                mkdir -p "${CLEAN_X}/${VER_NAME}"
+                [[ -f "${VER_DIR}/modules.dep" ]] && cp "${VER_DIR}/modules.dep" "${CLEAN_X}/${VER_NAME}/modules.dep"
+                GROW_MOD_STAGE="${CLEAN_X}"
+            fi
         fi
         rm -rf "${MOD_SRC_X}" "${Gkeep}"
     fi
@@ -319,10 +324,15 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
 fi
 
 GROW_MOD_ARGS=()
-if [[ -n "${GROW_MOD_STAGE}" && -d "${GROW_MOD_STAGE}" ]]; then
+if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     # -rm_r 是变长路径列表命令；后接其他命令须用 -- 终止路径列表。
-    # 顺序：路径列表 /grow/modules，然后 -- 结束，再接 -map。
-    GROW_MOD_ARGS=(-rm_r /grow/modules -- -map "${GROW_MOD_STAGE}" /grow/modules)
+    # 总是删除模板残留的 /grow/modules（避免 ext4-only 时残留 xfs/btrfs）；
+    # 仅当裁剪后有模块保留时才 -map 注入干净版（纯用户态 fs 无内核模块则只删不注）。
+    if [[ -n "${GROW_MOD_STAGE}" && -d "${GROW_MOD_STAGE}" ]]; then
+        GROW_MOD_ARGS=(-rm_r /grow/modules -- -map "${GROW_MOD_STAGE}" /grow/modules)
+    else
+        GROW_MOD_ARGS=(-rm_r /grow/modules --)
+    fi
 fi
 
 xorriso -indev "${TEMPLATE_PATH}" \
