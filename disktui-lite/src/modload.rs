@@ -1,4 +1,4 @@
-//! 内核模块加载：解析 /lib/modules/<ver>/modules.dep 依赖表，
+//! 内核模块加载：解析 `/lib/modules/<ver>/modules.dep` 依赖表，
 //! 按依赖序经 finit_module(2) 加载模块。
 //!
 //! 前提（由模板构建与 /etc/modules 清单保证）：
@@ -6,6 +6,12 @@
 //! - 不处理 alias / options；符号依赖由 modules.dep 覆盖并自动按序加载，
 //!   softdep（如 libcrc32c 的 pre: crc32c）不在依赖表中，需清单显式前置
 //! - 模块名即 .ko 文件名 stem；`-` 与 `_` 等价（内核侧 canonical 为下划线）
+//!
+//! 多根搜索：依赖知识由 initrd `/lib/modules/<ver>/modules.dep` 一份全量提供
+//! （含 grow 条目）；grow 阶段经 `add_media_module_root()` 追加 ISO
+//! `/grow/modules/<ver>/` 作为 .ko 物理挂载点（grow 专用模块不进 initrd，见
+//! build GROW_TOOLS），该根不含独立 modules.dep。finit 按下标升序找文件，
+//! 跨根依赖由全量 map + 双根自动覆盖。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -13,9 +19,15 @@ use std::path::{Path, PathBuf};
 
 use nix::kmod::{finit_module, ModuleInitFlags};
 
+/// 模块根目录：initrd 优先，boot 介质 /grow/modules 兜底（grow 专用模块）。
+/// 搜索顺序保证 boot 闭包模块留在 initrd、grow 模块从 ISO 加载时互不冲突。
+const BOOT_MEDIA_MODULES_REL: &str = "grow/modules";
+
 /// 依赖表缓存：构建一次，多次加载共用
 pub struct ModuleLoader {
-    base: PathBuf,
+    /// 模块检索根（相对 modules.dep 条目的 base）。[0] 为 initrd；
+    /// grow 阶段追加 ISO /grow/modules/<ver>。加载失败时按下标升序遍历。
+    bases: Vec<PathBuf>,
     map: HashMap<String, Entry>,
 }
 
@@ -27,14 +39,33 @@ struct Entry {
 }
 
 impl ModuleLoader {
-    /// 读 /proc/sys/kernel/osrelease 并解析 modules.dep；失败即无模块可载
+    /// 读 /proc/sys/kernel/osrelease 并解析 initrd 的 modules.dep；失败即无模块可载
     pub fn new() -> Result<Self, String> {
         let ver = fs::read_to_string("/proc/sys/kernel/osrelease")
             .map_err(|e| format!("read osrelease: {e}"))?;
         let base = PathBuf::from("/lib/modules").join(ver.trim());
         let dep_text = fs::read_to_string(base.join("modules.dep"))
             .map_err(|e| format!("read modules.dep: {e}"))?;
-        Ok(Self { base, map: parse_modules_dep(&fold_continuations(&dep_text)) })
+        Ok(Self {
+            bases: vec![base.clone()],
+            map: parse_modules_dep(&fold_continuations(&dep_text)),
+        })
+    }
+
+    /// 追加 boot 介质上的 grow 模块根（grow 专用模块的 .ko 物理挂载点）。
+    /// 依赖知识（map）已由 initrd 的『全量 modules.dep』完整提供，含 grow 条目；
+    /// grow 树只放 .ko，不重复带 modules.dep。此处仅追加根用于 finit 找文件。
+    /// 仅 grow 阶段调用——此时 BOOT_MEDIA_DIR 已挂载。
+    pub fn add_media_module_root(&mut self) {
+        let Some(ver) = self.bases[0].file_name().and_then(|s| s.to_str()).map(String::from) else {
+            return;
+        };
+        let secondary = PathBuf::from(crate::utils::BOOT_MEDIA_DIR)
+            .join(BOOT_MEDIA_MODULES_REL).join(&ver);
+        // 幂等：同一根不重复追加
+        if !self.bases.contains(&secondary) {
+            self.bases.push(secondary);
+        }
     }
 
     /// 单模块入口：依赖先载，已加载则跳过（幂等）。
@@ -99,15 +130,22 @@ impl ModuleLoader {
         let Some(entry) = self.map.get(stem) else {
             return Err(format!("'{stem}' not in modules.dep"));
         };
-        let full_path = self.base.join(&entry.path);
-        let file = File::open(&full_path)
-            .map_err(|e| format!("open {}: {e}", full_path.display()))?;
-        // 无模块参数；EEXIST 表示模块已在内核中，同样视为成功
-        match finit_module(&file, c"", ModuleInitFlags::empty()) {
-            Ok(()) => Ok(()),
-            Err(nix::errno::Errno::EEXIST) => Ok(()),
-            Err(e) => Err(format!("finit_module {}: {e}", full_path.display())),
+        // 按下标顺序扫描多根：initrd 无此 .ko 时落到 ISO /grow/modules/<ver>
+        for base in &self.bases {
+            let full_path = base.join(&entry.path);
+            let Ok(file) = File::open(&full_path) else {
+                continue;
+            };
+            // 无模块参数；EEXIST 表示模块已在内核中，同样视为成功
+            if let Err(e) = finit_module(&file, c"", ModuleInitFlags::empty()) {
+                match e {
+                    nix::errno::Errno::EEXIST => return Ok(()),
+                    _ => return Err(format!("finit_module {}: {e}", full_path.display())),
+                }
+            }
+            return Ok(());
         }
+        Err(format!("kext '{}' not found in any module root", entry.path))
     }
 }
 
@@ -162,7 +200,7 @@ mod tests {
 
     fn loader(text: &str) -> ModuleLoader {
         ModuleLoader {
-            base: PathBuf::from("/lib/modules/test"),
+            bases: vec![PathBuf::from("/lib/modules/test")],
             map: parse_modules_dep(&fold_continuations(text)),
         }
     }

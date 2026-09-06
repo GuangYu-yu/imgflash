@@ -151,7 +151,7 @@ cd ..
 | `DEBIAN_MIRROR` | Debian 镜像源 | `https://ftp.debian.org/debian` |
 | `DEBIAN_SUITE` | Debian 套件版本（留空=自动获取最新稳定版代号） | 留空（自动） |
 | `VOLUME_LABEL` | ISO 卷标 | `IMGFLASH` |
-| `MOD_FILESYSTEM` | 文件系统模块（squashfs / isofs / loop） | 见 build.env |
+| `MOD_FILESYSTEM` | boot 文件系统模块（squashfs / isofs / loop，进 initrd） | 见 build.env |
 | `MOD_NLS` | NLS 字符集模块 | 见 build.env |
 | `MOD_ATA` | ATA/AHCI 控制器模块 | 见 build.env |
 | `MOD_USB` | USB 存储模块（含 UAS） | 见 build.env |
@@ -168,7 +168,7 @@ cd ..
 | `USE_TUI` | 安装器模式（1=TUI / 0=Shell） | `1` |
 | `GROW_ENABLED` | dd 后自动扩容（构建期开关，1=工具随构建注入 ISO `/grow/`） | `1` |
 | `GROW_PART` | 指定扩容分区号（`auto`=自动选择；候选校验失败则跳过） | `auto` |
-| `GROW_TOOLS` | 注入哪些文件系统扩容工具到 ISO `/grow/`（`ext4,xfs,ntfs,btrfs,lvm` 子集；sfdisk/mkswap/partx 为核心依赖无条件注入） | `"ext4,xfs,ntfs,btrfs,lvm"` |
+| `GROW_TOOLS` | 注入哪些文件系统扩容工具到 ISO `/grow/` 并派生对应 grow 内核模块到 `/grow/modules/`（`ext4,xfs,ntfs,btrfs,lvm` 子集；sfdisk/mkswap/partx 为核心依赖无条件注入；仅 xfs/btrfs 关联内核模块，ext4/ntfs 为纯用户态） | `"ext4,xfs,ntfs,btrfs,lvm"` |
 | `BOOT_TIMEOUT` | 启动菜单超时（秒） | `0` |
 | `KERNEL_PARAMS` | 内核启动参数 | `quiet` |
 | `SCAN_TIMEOUT` | 启动时扫描介质的超时秒数 | `10` |
@@ -279,7 +279,7 @@ dd 写入成功后，安装器自动将目标盘尾部空闲空间分配给可�
     *   Swap 是最后一个分区，且前一个分区不可扩展（如 FAT）。
 *   **逃生门**：内核参数 `grow=off` 可在运行期强制禁用。
 *   **架构**：工具 + `grow.conf` 住 ISO `/grow/`；**LICENSES.txt 位于 `binaries/<ARCH>/grow/`**，作为随 Release 发布的源提供物，不注入 ISO。
-*   **架构**：initramfs 只含 grow 逻辑与条件 xfs.ko，故工具版本与模板解耦。
+*   **架构**：initramfs 仅含 boot 必需内核模块闭包（存储/光驱/iso9660/squashfs/loop）；grow 专用内核模块（xfs/btrfs/dm-mod）随模板固化在 ISO `/grow/modules/<ver>/`，运行期由 modload 双根搜索（initrd miss → ISO）按需加载，工具版本与模板内核同源解耦。
 
 安装结果屏会显示一行扩容状态（Expanded / Skipped / Partial / Failed）；Partial 状态附自包含的手动恢复命令（重启后 `/run` 数据即失）。
 

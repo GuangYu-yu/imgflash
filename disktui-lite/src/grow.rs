@@ -356,16 +356,9 @@ pub fn read_swap_info(dev: &mut dyn ReadSeek, part_offset: u64) -> Option<SwapIn
     if !is_swap_magic(page) {
         return None;
     }
-    // mkswap -U / libuuid uuid_parse 只接受 8-4-4-4-12 带连字符格式，swap 头字节序即 uuid_unparse 顺序
-    let uuid = page[1036..1052]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .concat();
-    let uuid = format!(
-        "{}-{}-{}-{}-{}",
-        &uuid[0..8], &uuid[8..12], &uuid[12..16], &uuid[16..20], &uuid[20..32]
-    );
+    // swap 头 UUID @1036 为 RFC 大端序；Uuid::from_bytes → hyphenated（8-4-4-4-12）
+    let raw: [u8; 16] = page[1036..1052].try_into().map_err(|_| ()).ok()?;
+    let uuid = uuid::Uuid::from_bytes(raw).hyphenated().to_string();
     let label_end = page[1052..1068].iter().position(|&b| b == 0).unwrap_or(16);
     let label = String::from_utf8_lossy(&page[1052..1052 + label_end]).trim().to_string();
     Some(SwapInfo { uuid, label })
@@ -680,10 +673,13 @@ fn tool_path(name: &str) -> String {
     format!("{BOOT_MEDIA_DIR}/{GROW_TOOLS_DIR}/{name}")
 }
 
-/// 按需加载单个内核模块（xfs/btrfs/dm-mod 场景的防御纵深）
+/// 按需加载单个内核模块（xfs/btrfs/dm-mod 场景的防御纵深）。
+/// grow 阶段 BOOT_MEDIA_DIR 已挂载，追加 ISO /grow/modules/<ver> 作为兜底根：
+/// boot 闭包模块仍在 initrd，grow 专用模块从 ISO 加载。
 #[cfg(target_os = "linux")]
 fn ensure_kernel_module(name: &str) -> Result<(), String> {
-    crate::modload::ModuleLoader::new().and_then(|l| l.load(name))
+    crate::modload::ModuleLoader::new()
+        .and_then(|mut l| { l.add_media_module_root(); l.load(name) })
 }
 
 /// 原子写（write-to-tmp + rename，同 /run tmpfs 内 rename 原子），
@@ -914,11 +910,13 @@ fn wait_partition_visible(ctx: &GrowCtx, part_num: u32, min_size: u64) -> bool {
     if poll(min_size) {
         return true;
     }
-    // 兜底：节点缺失 → partx -a（读盘添加缺失分区）；尺寸不符 → partx -u（更新已存在分区）
+    // 兜底：节点缺失 → partx --add；尺寸不符 → partx --update。--nr 限精确分区，
+    // 避免全盘分区刷新产生不必要 I/O / 无关分区 EBUSY（partx(8) 支持 --nr 单分区）
     let node_missing = sysfs_part_size(&ctx.disk_name, part_num).is_none();
     let mode = if node_missing { "-a" } else { "-u" };
-    ctx.log(&format!("kernel reread incomplete, trying partx {mode}"));
-    let _ = ctx.run(&tool_path(PARTX), &[mode, &ctx.disk], None);
+    let nr = part_num.to_string();
+    ctx.log(&format!("kernel reread incomplete, trying partx {mode} --nr {nr}"));
+    let _ = ctx.run(&tool_path(PARTX), &[mode, "--nr", &nr, &ctx.disk], None);
     poll(min_size)
 }
 
@@ -933,18 +931,26 @@ fn read_gpt_header(disk: &str, lba_bytes: u64) -> Option<(u64, (u32, u32))> {
 }
 
 /// backup header 是否已在设备末端标准位（relocate 成功/无需迁移的判据）。
-/// UEFI 规范：backup header 位于最后一个 LBA 起始处，my_lba（@header+24）
-/// 指向 header 自身——签名 + my_lba 双重校验，排除设备尾部残留旧 GPT
-/// 签名（my_lba 指向别处）造成的误判；偏移与 my_lba 均按 LBA 单位计算
+/// UEFI 规范：backup header 位于最后 LBA，primary header 的 AlternateLBA（@+32）
+/// 应指向它。此处同时校验 backup 的 MyLBA（@+24）与 primary 的 AlternateLBA，
+/// 排除"设备尾部残留旧 GPT 备份、primary 仍指向旧位置"造成的误判已就位。
 fn backup_header_at_end(disk: &str, device_sectors: u64, lba_bytes: u64) -> bool {
     let Ok(mut f) = File::open(disk) else { return false };
     let Some(device_bytes) = device_sectors.checked_mul(SECTOR) else { return false };
     let Some(off) = device_bytes.checked_sub(lba_bytes) else { return false };
     let last_lba = device_bytes / lba_bytes - 1;
     let mut header = [0u8; 512];
-    read_at(&mut f, off, &mut header) == 512
+    let backup_ok = read_at(&mut f, off, &mut header) == 512
         && &header[0..8] == b"EFI PART"
-        && le64(&header[24..32]) == last_lba
+        && le64(&header[24..32]) == last_lba;
+    if !backup_ok {
+        return false;
+    }
+    // 校验 primary header（LBA1）的 AlternateLBA（@32..40）指向末尾备份 LBA
+    let mut primary = [0u8; 512];
+    read_at(&mut f, lba_bytes, &mut primary) == 512
+        && &primary[0..8] == b"EFI PART"
+        && le64(&primary[32..40]) == last_lba
 }
 
 /// 工具存在性检查集合：手术路径额外需要 sfdisk/mkswap/partx

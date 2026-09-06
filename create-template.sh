@@ -198,23 +198,26 @@ cp "${SCRIPT_DIR}/binaries/disktui-lite" "${INITRAMFS_DIR}/usr/bin/disktui-lite"
 chmod +x "${INITRAMFS_DIR}/usr/bin/disktui-lite"
 ln -s /usr/bin/disktui-lite "${INITRAMFS_DIR}/init"
 
-# --- grow：工具随 fast path 注入 ISO 根 /grow/，模板仅条件附带 fs 内核模块 ---
-# 精确条目匹配（不用 *ext4* 子串——会误配 ext4foo 之类）
+# --- grow：fs 内核模块派生进 GROW_MODULES，随模板注入 ISO /grow/modules/<ver>/ ---
+# 工具/conf 由 fast path 注入 /grow/，但 grow 专用模块树必须随模板固化
+# （fast path 无模板 KVER 的 .ko）。模板仅含模块树，不含 grow 二进制。
 # xfs/btrfs 在线扩容需 mount（内核驱动）；lvm 需 device-mapper
 # crc32c_generic 前置于 xfs/btrfs：libcrc32c 有 softdep(pre: crc32c)，内置
 # 模块加载器与 modprobe 同样不解析 modules.softdep，不显式先载则
 # libcrc32c init 时找不到 "crc32c" 算法而失败
+GROW_MODULES=""
 if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs; then
-        MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic xfs"
+        GROW_MODULES="${GROW_MODULES} crc32c_generic xfs"
     fi
     if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs; then
-        MOD_FILESYSTEM="${MOD_FILESYSTEM} crc32c_generic btrfs"
+        GROW_MODULES="${GROW_MODULES} crc32c_generic btrfs"
     fi
     if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm; then
-        MOD_FILESYSTEM="${MOD_FILESYSTEM} dm-mod"
+        GROW_MODULES="${GROW_MODULES} dm-mod"
     fi
 fi
+GROW_MODULES="${GROW_MODULES#" "}"
 
 # 模块列表
 BASE_MODULES="${MOD_FILESYSTEM} ${MOD_NLS} ${MOD_ATA} ${MOD_USB} ${MOD_CDROM} ${MOD_INPUT} ${MOD_EMMC} ${MOD_EMMC_CARDREADER} ${MOD_EMMC_USB:-}"
@@ -230,21 +233,21 @@ MOD_SRC="${ROOTFS_DIR}/lib/modules/${KVER}"
 
 depmod -b "${ROOTFS_DIR}" "${KVER}"
 
-echo "  正在解析模块依赖链 ..."
-NEEDED_FILES=""
+echo "  正在解析模块依赖链（boot）..."
+BOOT_FILES=""
 for mod in ${REQUIRED_MODULES}; do
     deps=$(modprobe -d "${ROOTFS_DIR}" -S "${KVER}" --show-depends "$mod" 2>/dev/null \
         | awk '/^insmod/ {print $2}')
-    NEEDED_FILES="${NEEDED_FILES} ${deps}"
+    BOOT_FILES="${BOOT_FILES} ${deps}"
 done
-NEEDED_FILES=$(echo "$NEEDED_FILES" | tr ' ' '\n' | sort -u | grep .)
+BOOT_FILES=$(echo "$BOOT_FILES" | tr ' ' '\n' | sort -u | grep .)
 
-[[ -n "$NEEDED_FILES" ]] || die "modprobe 未能解析任何模块依赖，构建环境异常"
+[[ -n "$BOOT_FILES" ]] || die "modprobe 未能解析 boot 模块依赖，构建环境异常"
 
 MOD_DEST="${INITRAMFS_DIR}/lib/modules/${KVER}"
-echo "  包含 $(echo "$NEEDED_FILES" | wc -l) 个模块（含依赖）"
+echo "  boot 模块：$(echo "$BOOT_FILES" | wc -l) 个（含依赖）"
 
-for mod_file in $NEEDED_FILES; do
+for mod_file in $BOOT_FILES; do
     rel_path=$(echo "$mod_file" | sed "s|${MOD_SRC}/||")
     dest_dir="${MOD_DEST}/$(dirname "$rel_path")"
     mkdir -p "$dest_dir"
@@ -254,6 +257,25 @@ done
 for f in modules.builtin modules.builtin.modinfo; do
     [ -f "${MOD_SRC}/$f" ] && cp "${MOD_SRC}/$f" "${MOD_DEST}/"
 done
+
+# grow 专用模块闭包 → 暂存，Phase4 注入模板 ISO /grow/modules/<ver>/（不进 initrd）
+GROW_TREE="${BUILD_DIR}/grow-modules"
+if [[ -n "${GROW_MODULES}" ]]; then
+    GROW_FILES=""
+    for mod in ${GROW_MODULES}; do
+        deps=$(modprobe -d "${ROOTFS_DIR}" -S "${KVER}" --show-depends "$mod" 2>/dev/null \
+            | awk '/^insmod/ {print $2}')
+        GROW_FILES="${GROW_FILES} ${deps}"
+    done
+    GROW_FILES=$(echo "$GROW_FILES" | tr ' ' '\n' | sort -u | grep .)
+    echo "  grow 模块：$(echo "$GROW_FILES" | wc -l) 个（含依赖，入模板 ISO /grow/modules/）"
+    for mod_file in $GROW_FILES; do
+        rel_path=$(echo "$mod_file" | sed "s|${MOD_SRC}/||")
+        dest_dir="${GROW_TREE}/${KVER}/$(dirname "$rel_path")"
+        mkdir -p "$dest_dir"
+        xz -dc "$mod_file" > "${dest_dir}/$(basename "${rel_path%.xz}")"
+    done
+fi
 
 cp "${VMLINUZ}"  "${BUILD_DIR}/vmlinuz"
 cp "${GRUB_SRC}" "${BUILD_DIR}/grub.efi"
@@ -265,8 +287,11 @@ if [[ "${ENABLE_SECURE_BOOT}" == "1" ]]; then
     SHIM_SRC="${BUILD_DIR}/shim.efi"
 fi
 
+# initrd 独一份全量 modules.dep（depmod -b ROOTFS 已生成，含 boot + grow 全部条目，
+# 是 modload 构建完整依赖 map 的唯一来源）。grow 树只放 .ko，不重复带 modules.dep。
+cp "${MOD_SRC}/modules.dep" "${MOD_DEST}/modules.dep"
+
 rm -rf "${ROOTFS_DIR}"
-depmod -b "${INITRAMFS_DIR}" "${KVER}"
 
 MOD_COUNT=$(find "${INITRAMFS_DIR}/lib/modules" -name '*.ko' | wc -l)
 MOD_SIZE=$(du -sh "${INITRAMFS_DIR}/lib/modules" | awk '{print $1}')
@@ -292,7 +317,12 @@ mkdir -p "${ISO_DIR}/boot"
 mv "${VMLINUZ}" "${ISO_DIR}/boot/vmlinuz"
 mv "${BUILD_DIR}/initrd.img" "${ISO_DIR}/boot/initrd.img"
 # grow 工具/conf/许可证均由 fast path（build-from-template.sh）注入 ISO 根 /grow/，
-# 模板不携带——能力随构建可变，消除模板与工具版本脱同步风险
+# 但 grow 专用内核模块树随模板固化（fast path 无模板 KVER 的 .ko）。
+# 与模板内核同源，消除模块与工具版本的脱同步风险
+if [[ "${GROW_ENABLED:-0}" == "1" && -d "${GROW_TREE}" ]]; then
+    mkdir -p "${ISO_DIR}/grow/modules"
+    cp -a "${GROW_TREE}/." "${ISO_DIR}/grow/modules/"
+fi
 
 # --- BIOS 引导（syslinux，仅 amd64） ---
 if [[ "${HAS_BIOS}" -eq 1 ]]; then
