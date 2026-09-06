@@ -371,6 +371,17 @@ if [[ -n "${GROW_MODULES}" ]]; then
         mkdir -p "$dest_dir"
         xz -dc "$mod_file" > "${dest_dir}/$(basename "${rel_path%.xz}")"
     done
+
+    # grow 树 modules.dep：从 ROOTFS 全量 modules.dep 提取 grow 闭包条目。
+    # 闭包内模块的相对路径 == modules.dep 的 path（均为相对 MOD_SRC），
+    # 精确按行首 path: 匹配；.ko.xz → .ko 与裸 .ko 文件对应。
+    : > "${GROW_TREE}/${KVER}/modules.dep"
+    for mod_file in $GROW_FILES; do
+        rel_path=$(echo "$mod_file" | sed "s|${MOD_SRC}/||")
+        grep "^${rel_path}:" "${MOD_SRC}/modules.dep" >> "${GROW_TREE}/${KVER}/modules.dep" 2>/dev/null
+    done
+    sort -u -o "${GROW_TREE}/${KVER}/modules.dep" "${GROW_TREE}/${KVER}/modules.dep"
+    sed -i 's/\.ko\.xz/.ko/g' "${GROW_TREE}/${KVER}/modules.dep"
 fi
 
 cp "${VMLINUZ}"  "${BUILD_DIR}/vmlinuz"
@@ -383,9 +394,10 @@ if [[ "${ENABLE_SECURE_BOOT:-0}" == "1" ]]; then
     SHIM_SRC="${BUILD_DIR}/shim.efi"
 fi
 
-# initrd 独一份全量 modules.dep（depmod -b ROOTFS 已生成，含 boot + grow 全部条目，
-# 是 modload 构建完整依赖 map 的唯一来源）。grow 树只放 .ko，不重复带 modules.dep。
-cp "${MOD_SRC}/modules.dep" "${MOD_DEST}/modules.dep"
+# initramfs 的 modules.dep 必须对 initramfs 自身重新生成（而非复制 ROOTFS 全量）：
+# 只包含实际拷入的 boot 闭包裸 .ko，路径为 .ko（非 .ko.xz），modload 才能匹配。
+# grow 模块的依赖由 ISO 端 /grow/modules/<ver>/modules.dep 提供（modload 双根，initrd miss 后查 ISO）。
+depmod -b "${INITRAMFS_DIR}" "${KVER}"
 
 rm -rf "${ROOTFS_DIR}"
 

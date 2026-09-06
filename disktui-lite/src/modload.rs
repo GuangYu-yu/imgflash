@@ -53,8 +53,9 @@ impl ModuleLoader {
     }
 
     /// 追加 boot 介质上的 grow 模块根（grow 专用模块的 .ko 物理挂载点）。
-    /// 依赖知识（map）已由 initrd 的『全量 modules.dep』完整提供，含 grow 条目；
-    /// grow 树只放 .ko，不重复带 modules.dep。此处仅追加根用于 finit 找文件。
+    /// initrd 的 modules.dep 只含 boot 闭包；grow 树的 modules.dep 描述 grow 闭包。
+    /// 此处追加根用于 finit 找文件，并合并 grow 树的依赖表进 map（同名冲突保留
+    /// initrd 优先——boot 模块优先于同名 grow 条目，实际很少重叠）。
     /// 仅 grow 阶段调用——此时 BOOT_MEDIA_DIR 已挂载。
     pub fn add_media_module_root(&mut self) {
         let Some(ver) = self.bases[0].file_name().and_then(|s| s.to_str()).map(String::from) else {
@@ -62,10 +63,16 @@ impl ModuleLoader {
         };
         let secondary = PathBuf::from(crate::utils::BOOT_MEDIA_DIR)
             .join(BOOT_MEDIA_MODULES_REL).join(&ver);
-        // 幂等：同一根不重复追加
-        if !self.bases.contains(&secondary) {
-            self.bases.push(secondary);
+        // 幂等:合并一次即 push
+        if self.bases.contains(&secondary) {
+            return;
         }
+        if let Ok(dep_text) = fs::read_to_string(secondary.join("modules.dep")) {
+            for (key, entry) in parse_modules_dep(&fold_continuations(&dep_text)) {
+                self.map.entry(key).or_insert(entry);
+            }
+        }
+        self.bases.push(secondary);
     }
 
     /// 单模块入口：依赖先载，已加载则跳过（幂等）。

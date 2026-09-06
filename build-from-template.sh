@@ -304,6 +304,8 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
                 mkdir -p "$(dirname "${dst}")"
                 cp "${src}" "${dst}"
             done < "${Gkeep}"
+            # 保留 grow 树 modules.dep（grow 依赖解析依赖它；多余 fs 条目无害，modload 只加载实际调用模块）
+            [[ -f "${VER_DIR}/modules.dep" ]] && cp "${VER_DIR}/modules.dep" "${CLEAN_X}/${VER_NAME}/modules.dep"
             GROW_MOD_STAGE="${CLEAN_X}"
         fi
         rm -rf "${MOD_SRC_X}" "${Gkeep}"
