@@ -318,7 +318,9 @@ fi
 
 GROW_MOD_ARGS=()
 if [[ -n "${GROW_MOD_STAGE}" && -d "${GROW_MOD_STAGE}" ]]; then
-    GROW_MOD_ARGS=(-rm_r /grow/modules -map "${GROW_MOD_STAGE}" /grow/modules)
+    # -rm_r 是变长路径列表命令；后接其他命令须用 -- 终止路径列表。
+    # 顺序：路径列表 /grow/modules，然后 -- 结束，再接 -map。
+    GROW_MOD_ARGS=(-rm_r /grow/modules -- -map "${GROW_MOD_STAGE}" /grow/modules)
 fi
 
 xorriso -indev "${TEMPLATE_PATH}" \
