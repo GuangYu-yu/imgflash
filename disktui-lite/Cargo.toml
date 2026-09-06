@@ -11,7 +11,7 @@ ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"
 nix = { version = "0.31", features = ["mount", "signal", "reboot", "fs", "kmod"] }
-uu_dd = "0.10"
+uu_dd = "0.11"
 uuid = { version = "1", default-features = false, features = ["std"] }
 
 [[bin]]
