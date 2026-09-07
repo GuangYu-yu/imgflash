@@ -323,16 +323,9 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     fi
 fi
 
-GROW_MOD_ARGS=()
-if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
-    # -rm_r 是变长路径列表命令；后接其他命令须用 -- 终止路径列表。
-    # 总是删除模板残留的 /grow/modules（避免 ext4-only 时残留 xfs/btrfs）；
-    # 仅当裁剪后有模块保留时才 -map 注入干净版（纯用户态 fs 无内核模块则只删不注）。
-    if [[ -n "${GROW_MOD_STAGE}" && -d "${GROW_MOD_STAGE}" ]]; then
-        GROW_MOD_ARGS=(-rm_r /grow/modules -- -map "${GROW_MOD_STAGE}" /grow/modules)
-    else
-        GROW_MOD_ARGS=(-rm_r /grow/modules --)
-    fi
+GROW_MOD_ARGS=(-rm_r /grow/modules --)
+if [[ "${GROW_ENABLED:-0}" == "1" && -n "${GROW_MOD_STAGE}" && -d "${GROW_MOD_STAGE}" ]]; then
+    GROW_MOD_ARGS+=(-map "${GROW_MOD_STAGE}" /grow/modules)
 fi
 
 xorriso -indev "${TEMPLATE_PATH}" \
