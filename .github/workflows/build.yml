@@ -56,6 +56,10 @@ on:
         description: '打包扩容工具: lvm'
         type: boolean
         default: true
+      grow_fs_f2fs:
+        description: '打包扩容工具: f2fs'
+        type: boolean
+        default: true
       no_cache:
         description: '不使用缓存，强制重新构建'
         type: boolean
@@ -175,6 +179,7 @@ jobs:
           [ "${{ github.event.inputs.grow_fs_ntfs }}" == "true" ] && TOOLS="${TOOLS} ntfs"
           [ "${{ github.event.inputs.grow_fs_btrfs }}" == "true" ] && TOOLS="${TOOLS} btrfs"
           [ "${{ github.event.inputs.grow_fs_lvm }}" == "true" ] && TOOLS="${TOOLS} lvm"
+          [ "${{ github.event.inputs.grow_fs_f2fs }}" == "true" ] && TOOLS="${TOOLS} f2fs"
           TOOLS="${TOOLS# }"
           TOOLS="${TOOLS// /,}"
           sed -i "s/^GROW_TOOLS=.*/GROW_TOOLS=\"${TOOLS}\"/" build.env

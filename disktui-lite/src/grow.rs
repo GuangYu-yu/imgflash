@@ -147,6 +147,7 @@ pub enum FsKind {
     Xfs,
     Ntfs,
     Btrfs,
+    F2fs,
     Swap,
     Luks,
     Lvm,
@@ -312,6 +313,10 @@ pub fn sniff_fs(dev: &mut dyn ReadSeek, part_offset: u64) -> FsKind {
     }
     if magic(buf, 0x10040, b"_BHRfS_M") {
         return FsKind::Btrfs;
+    }
+    // F2FS 魔数 0xF2F52010，superblock 位于分区偏移 0x400，魔数在 superblock 首 4 字节（小端）
+    if magic(buf, 0x400, &[0x10, 0x20, 0xF5, 0xF2]) {
+        return FsKind::F2fs;
     }
     if magic(buf, 0, b"LUKS\xBA\xBE") {
         return FsKind::Luks;
@@ -482,7 +487,7 @@ fn unsupported_reason(fs: FsKind) -> String {
 
 /// 可原地扩容的 fs 集合（单一来源：superfloppy / swap 手术 / 常规候选共用）
 fn is_growable(fs: FsKind) -> bool {
-    matches!(fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm)
+    matches!(fs, FsKind::Ext | FsKind::Xfs | FsKind::Ntfs | FsKind::Btrfs | FsKind::Lvm | FsKind::F2fs)
 }
 
 /// 分区设备名：内核规则——设备名以数字结尾加 p（nvme0n1p3/loop0p1/md126p1），否则直接拼接（sda3）
@@ -663,6 +668,9 @@ const RESIZE2FS: &str = "resize2fs";
 const XFS_GROWFS: &str = "xfs_growfs";
 const NTFSRESIZE: &str = "ntfsresize";
 const BTRFS: &str = "btrfs";
+/// F2FS 双工具：fsck.f2fs 一致性预检 + resize.f2fs 扩容（同 f2fs-tools 包）
+const FSCK_F2FS: &str = "fsck.f2fs";
+const RESIZE_F2FS: &str = "resize.f2fs";
 /// LVM2 多调用二进制：统一以 `lvm <子命令>` 形式调用（pvresize/lvs/vgchange/lvextend）
 const LVM: &str = "lvm";
 /// 工具子目录（相对安装介质根）
@@ -976,6 +984,7 @@ fn tools_missing(fs: FsKind, need: ToolNeed) -> Option<String> {
         FsKind::Xfs => &[XFS_GROWFS],
         FsKind::Ntfs => &[NTFSRESIZE],
         FsKind::Btrfs => &[BTRFS],
+        FsKind::F2fs => &[FSCK_F2FS, RESIZE_F2FS],
         FsKind::Lvm => &[LVM],
         _ => &[],
     };
@@ -1101,6 +1110,26 @@ fn resize_fs(ctx: &GrowCtx, fs: FsKind, target: &str) -> Result<(), String> {
             }
         }
         FsKind::Btrfs => grow_mounted_fs(ctx, target, &BTRFS_GROW),
+        // F2FS 裸设备扩容（同 ext4 模式），但 fsck 语义与 e2fsck 截然不同：
+        // -a/-p 并非无条件完整检查——官方语义为"仅当内核 F2FS 模块报告 bug 时才执行检查"，
+        //   默认禁用，因此不能当预检用。故此处用无参数 fsck.f2fs 做真正的一致性扫描。
+        // -f 是 force fix（修复全部不一致），无人值守 grow 阶段不应自动修改异常 fs，不传。
+        // fsck.f2fs 退出码：0 成功 / -1 失败（无 e2fsck 那套 0..=2 白名单，仅接受 0）。
+        // resize.f2fs 选项为 -d/-f/-s/-t/-i/-o/-V：不传 -t 默认 target=设备大小，
+        // target > 当前 fs 大小即走 grow 路径（-f 仅在 target≤当前时强走 grow，勿传）；
+        // -o 不传自动取最优 overprovision；-s 仅用于收缩路径。走默认路径即可。
+        FsKind::F2fs => {
+            match ctx.run(&tool_path(FSCK_F2FS), &[target], None) {
+                Some(0) => {}
+                Some(c) => return Err(format!("fsck.f2fs failed (exit {c}, filesystem inconsistent)")),
+                None => return Err("fsck.f2fs spawn failed".into()),
+            }
+            match ctx.run(&tool_path(RESIZE_F2FS), &[target], None) {
+                Some(0) => Ok(()),
+                Some(c) => Err(format!("resize.f2fs failed (exit {c})")),
+                None => Err("resize.f2fs spawn failed".into()),
+            }
+        }
         FsKind::Lvm => resize_lvm(ctx, target),
         _ => Err("unsupported filesystem".into()),
     }
@@ -1213,7 +1242,7 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
         return Err(format!("cannot open LV device {dm}"));
     };
     let lv_fs = sniff_fs(&mut dev, 0);
-    if !matches!(lv_fs, FsKind::Ext | FsKind::Xfs | FsKind::Btrfs) {
+    if !matches!(lv_fs, FsKind::Ext | FsKind::Xfs | FsKind::Btrfs | FsKind::F2fs) {
         return Err(format!("LV filesystem not growable ({lv_fs:?})"));
     }
     if let Some(reason) = tools_missing(lv_fs, ToolNeed::Plain) {
@@ -1346,6 +1375,7 @@ fn manual_cmd_for_fs(fs: FsKind, dev: &str) -> String {
         FsKind::Xfs => format!("mount -t xfs {dev} /mnt && xfs_growfs -d /mnt && umount /mnt"),
         FsKind::Ntfs => format!("ntfsresize {dev}"),
         FsKind::Btrfs => format!("mount -t btrfs {dev} /mnt && btrfs filesystem resize max /mnt && umount /mnt"),
+        FsKind::F2fs => format!("fsck.f2fs {dev} && resize.f2fs {dev}"),
         // VG/LV 名运行期才可知，占位符形式给全链路命令（顺序与 resize_lvm 实际执行链一致）
         FsKind::Lvm => format!(
             "pvresize {dev}; pvs; vgchange -ay <vg>; lvextend -l +100%FREE <vg>/<lv>; resize2fs /dev/mapper/<vg>-<lv> (xfs: mount+xfs_growfs -d, btrfs: mount+btrfs filesystem resize max)"

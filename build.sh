@@ -495,6 +495,12 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
         [[ -f "${GROW_BIN_DIR}/lvm" ]] || die "GROW_TOOLS=lvm 但 lvm 缺失"
         cp "${GROW_BIN_DIR}/lvm" "${GROW_STAGE}/"
     fi
+    if grow_tool_enabled f2fs; then
+        for t in fsck.f2fs resize.f2fs; do
+            [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "GROW_TOOLS=f2fs 但 ${t} 缺失"
+            cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
+        done
+    fi
 
     # 粗粒度 fail-fast：覆盖值必须真实存在（sfdisk 对镜像文件可用）
     if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then

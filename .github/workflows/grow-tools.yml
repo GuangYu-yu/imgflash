@@ -21,6 +21,9 @@ on:
       lvm2_version:
         description: 'LVM2 版本（示例 2.03.42）'
         required: false
+      f2fs_tools_version:
+        description: 'f2fs-tools 版本（示例 v1.16.0，官方无 tarball，走 git tag）'
+        required: false
 
 env:
   # xfsprogs 的两个硬依赖，随流水线统一升级，不作为输入
@@ -59,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y musl-tools linux-libc-dev dpkg-dev
+          sudo apt-get install -y musl-tools linux-libc-dev dpkg-dev autoconf automake libtool pkg-config git
           # musl-gcc 不搜 Ubuntu 多架构 triplet 目录，内核头在那里，
           # 不加 -idirafter util-linux 会报 "kernel headers required"
           MULTIARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
@@ -95,6 +98,7 @@ jobs:
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
           V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
           V_LVM:  ${{ github.event.inputs.lvm2_version }}
+          V_F2FS: ${{ github.event.inputs.f2fs_tools_version }}
         run: |
           set -euo pipefail
           U=$([[ -n "$V_UTIL" ]] && echo 1 || echo 0)
@@ -103,12 +107,17 @@ jobs:
           N=$([[ -n "$V_NTFS" ]] && echo 1 || echo 0)
           B=$([[ -n "$V_BTRFS" ]] && echo 1 || echo 0)
           G=$([[ -n "$V_LVM"  ]] && echo 1 || echo 0)
+          F=$([[ -n "$V_F2FS" ]] && echo 1 || echo 0)
           # btrfs-progs 链接 util-linux 的 libuuid/libblkid（prefix 依赖，
           # 增量构建时不重编 util-linux 就没有库）→ 必须伴随 util-linux 一起构建
           if [[ "$B" == "1" && "$U" != "1" ]]; then
             echo "ERROR: btrfs-progs 依赖 util-linux 的 libuuid/libblkid，请同时填写 util_linux_version"; exit 1
           fi
-          L=$([[ "$U$E$X$N$B$G" == "111111" ]] && echo 1 || echo 0)
+          # f2fs-tools 也硬依赖 util-linux 的 libuuid，同理必须伴随 util-linux 构建
+          if [[ "$F" == "1" && "$U" != "1" ]]; then
+            echo "ERROR: f2fs-tools 依赖 util-linux 的 libuuid，请同时填写 util_linux_version"; exit 1
+          fi
+          L=$([[ "$U$E$X$N$B$G$F" == "1111111" ]] && echo 1 || echo 0)
           BINS=""
           [[ "$U" == "1" ]] && BINS+=" sfdisk mkswap partx"
           [[ "$E" == "1" ]] && BINS+=" e2fsck resize2fs"
@@ -116,6 +125,7 @@ jobs:
           [[ "$N" == "1" ]] && BINS+=" ntfsresize"
           [[ "$B" == "1" ]] && BINS+=" btrfs"
           [[ "$G" == "1" ]] && BINS+=" lvm"
+          [[ "$F" == "1" ]] && BINS+=" fsck.f2fs resize.f2fs"
           BINS="${BINS# }"
           {
             echo "BUILD_UTIL=$U"
@@ -124,10 +134,11 @@ jobs:
             echo "BUILD_NTFS=$N"
             echo "BUILD_BTRFS=$B"
             echo "BUILD_LVM=$G"
+            echo "BUILD_F2FS=$F"
             echo "REWRITE_LICENSES=$L"
             echo "EXPECTED_BINS=$BINS"
           } >> "$GITHUB_ENV"
-          echo "plan: U=$U E=$E X=$X N=$N B=$B G=$G lic=$L bins=[$BINS]"
+          echo "plan: U=$U E=$E X=$X N=$N B=$B G=$G F=$F lic=$L bins=[$BINS]"
 
       - name: 下载源码
         env:
@@ -137,6 +148,7 @@ jobs:
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
           V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
           V_LVM:  ${{ github.event.inputs.lvm2_version }}
+          V_F2FS: ${{ github.event.inputs.f2fs_tools_version }}
         run: |
           set -euo pipefail
           dl() { echo "FETCH $1 -> $2"; curl -Lf --retry 3 -o "$1" "$2" || { echo "FAILED $1 -> $2"; return 1; }; }
@@ -175,6 +187,15 @@ jobs:
             pids="$pids $!"
           fi
           for p in $pids; do wait "$p"; done
+
+          # f2fs-tools 官方无发布 tarball（kernel.org/pub/linux/utils/fs/ 下无 f2fs/ 目录），
+          # 走 git 仓库并锁定 tag（v 前缀版本如 v1.16.0）。git 仓库不含 configure，
+          # 需自跑 autogen.sh 生成（autoconf/automake/libtool 已在工具链步骤安装）。
+          if [[ "$BUILD_F2FS" == "1" ]]; then
+            git clone --depth 1 --branch "${V_F2FS}" \
+              https://git.kernel.org/pub/scm/linux/kernel/git/jaegeuk/f2fs-tools.git \
+              "$SRC/f2fs-tools"
+          fi
 
           # ntfs-3g 必须用 tuxera 官方发布包：GitHub 归档不含 configure
           if [[ "$BUILD_UTIL" == "1" ]]; then tar -xf util-linux.tar.xz -C "$SRC"; fi
@@ -419,17 +440,52 @@ jobs:
           test -x btrfs.static
           cp btrfs.static "$OUT/btrfs"
 
+      - name: 编译 f2fs-tools
+        if: env.BUILD_F2FS == '1'
+        env:
+          V_F2FS: ${{ github.event.inputs.f2fs_tools_version }}
+        run: |
+          set -euo pipefail
+          cd "$SRC/f2fs-tools"
+          # 官方无 tarball，git 源不含 configure，先自跑 autogen.sh 生成
+          ./autogen.sh
+          # --without-selinux/blkid/lzo2/lz4：configure.ac 对这四者默认 check（非
+          # disable），库若碰巧在 runner 上可见就会启用，构建结果将依赖环境而非
+          # workflow 控制；OpenWrt 同款打包亦显式关闭。libuuid 为无条件探测（无
+          # --without 开关），由 util-linux 的 prefix 静态库提供（同 btrfs-progs
+          # 复用模式）；LDFLAGS=-static + make -all-static 的覆盖法与 util-linux/
+          # ntfs-3g 一致（libtool 会吞 configure 的 -static）。
+          # 多合一二进制：fsck/ 下只产出 fsck.f2fs，resize.c 编入其中，
+          # resize.f2fs 仅为 make install 时按 argv[0] 分发的符号链接 → 复制两份。
+          ./configure \
+            --prefix="$PREFIX" \
+            --without-selinux \
+            --without-blkid \
+            --without-lzo2 \
+            --without-lz4 \
+            --disable-shared --enable-static \
+            CC=musl-gcc \
+            CPPFLAGS="-I$PREFIX/include ${HOST_CPPFLAGS}" \
+            CFLAGS="${HOST_CFLAGS} -I$PREFIX/include" \
+            LDFLAGS="-static -L$PREFIX/lib"
+          make -j"$(nproc)" LDFLAGS="-all-static -L$PREFIX/lib"
+          cp fsck/fsck.f2fs "$OUT/fsck.f2fs"
+          cp fsck/fsck.f2fs "$OUT/resize.f2fs"
+
       - name: 校验产物
         run: |
           set -euo pipefail
           cd "$OUT"
           if [[ -z "$EXPECTED_BINS" ]]; then
             n=$(ls -1 | wc -l)
-            (( n >= 10 )) || { echo "ERROR: baseline 只有 $n 个文件，首次构建必须填齐 6 个版本"; exit 1; }
+            (( n >= 10 )) || { echo "ERROR: baseline 只有 $n 个文件，首次构建必须填齐 7 个版本"; exit 1; }
           else
             for t in $EXPECTED_BINS; do
               [[ -x "$t" ]] || { echo "ERROR: $t 未产出"; exit 1; }
               file "$t" | grep -q "statically linked" || { echo "ERROR: $t 非静态链接"; file "$t"; exit 1; }
+              # readelf 兜底：静态 ELF 无 dynamic section（grep 不命中即放行），
+              # 若有 NEEDED 则必有动态依赖 → 拒绝（比 ldd 对静态程序的输出更稳定）
+              readelf -d "$t" | grep -q NEEDED && { echo "ERROR: $t 存在动态依赖"; readelf -d "$t"; exit 1; } || true
               strip --strip-all "$t"
             done
           fi
@@ -443,6 +499,7 @@ jobs:
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
           V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
           V_LVM:  ${{ github.event.inputs.lvm2_version }}
+          V_F2FS: ${{ github.event.inputs.f2fs_tools_version }}
         run: |
           set -euo pipefail
           cd "$OUT"
@@ -473,6 +530,8 @@ jobs:
             echo "源码: https://cdn.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v${V_BTRFS}.tar.xz"
             echo "## LVM2 ${V_LVM} (GPL-2.0-or-later, libdm LGPL-2.1)"
             echo "源码: https://sourceware.org/ftp/lvm2/releases/LVM2.${V_LVM}.tgz"
+            echo "## f2fs-tools ${V_F2FS} (GPL-2.0-or-later)"
+            echo "源码: https://git.kernel.org/pub/scm/linux/kernel/git/jaegeuk/f2fs-tools.git (tag ${V_F2FS})"
             echo "## inih r${INIH_VERSION} (BSD-3-Clause) — xfsprogs 依赖"
             echo "源码: https://github.com/benhoyt/inih/archive/refs/tags/r${INIH_VERSION}.tar.gz"
             echo "## userspace-rcu ${URCU_VERSION} (LGPL-2.1-or-later) — xfsprogs 依赖"
@@ -505,6 +564,9 @@ jobs:
             echo "===== libdm COPYING.LIB (LGPL-2.1+) ====="
             cat "$SRC/LVM2.${V_LVM}/COPYING.LIB"
             echo ""
+            echo "===== f2fs-tools COPYING (GPL-2.0+) ====="
+            cat "$SRC/f2fs-tools/COPYING"
+            echo ""
             echo "===== inih LICENSE.txt (BSD-3) ====="
             cat "$SRC/inih/LICENSE.txt"
             echo ""
@@ -527,6 +589,7 @@ jobs:
           V_NTFS: ${{ github.event.inputs.ntfs3g_version }}
           V_BTRFS: ${{ github.event.inputs.btrfs_progs_version }}
           V_LVM:  ${{ github.event.inputs.lvm2_version }}
+          V_F2FS: ${{ github.event.inputs.f2fs_tools_version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -548,6 +611,7 @@ jobs:
           [[ -n "$V_NTFS" ]] && S+=", ntfs-3g ${V_NTFS}"
           [[ -n "$V_BTRFS" ]] && S+=", btrfs-progs ${V_BTRFS}"
           [[ -n "$V_LVM" ]] && S+=", LVM2 ${V_LVM}"
+          [[ -n "$V_F2FS" ]] && S+=", f2fs-tools ${V_F2FS}"
           S="${S#, }"
           [[ -z "$S" ]] && S="(housekeeping only, no package rebuild)"
           git commit -m "chore: update grow tools ${ARCH_DIR} (${S})"
