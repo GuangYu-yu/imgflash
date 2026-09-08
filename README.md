@@ -224,6 +224,8 @@ cd ..
 
 dd 写入成功后，安装器自动将目标盘尾部空闲空间分配给可扩容分区（末分区；若末分区为 swap，则手术重建 swap 并扩容其前一分区），并扩展其文件系统（ext4 / XFS / NTFS / Btrfs / LVM / F2FS），填满"盘 > 镜像"产生的尾部空闲空间。失败或跳过仅降级为警告，永不阻塞重启。
 
+OpenWrt / ImmortalWrt squashfs 固件是一个特例：官方 squashfs 固件是"同分区内前半段只读 squashfs 根 + 后半段 RW overlay（fstools `rootfs_data`）"布局，grow 做分区级扩容 + **首刷时交 mount_root 格式化 RW 层**。所以**首次刷入盘时只需 `GROW_ENABLED=1`**（不勾选任何 `GROW_TOOLS`，grow 不触碰文件系统），overlay RW 层的文件系统类型由 fstools 首启时按阈值（严格大于）`partition_size − offset > 100 MiB → F2FS`，否则 EXT4（`libfstools/common.c use_f2fs()`）。但**已刷入后二次扩容**（rootfs_data 已格式化）则必须 `GROW_TOOLS=ext4,f2fs`，否则工具守卫（在动盘之前）直接 Skipped，分区与 RW 层均不会被触碰。EROFS overlay 当前暂不支持（Skipped）。
+
 ### 常见布局与处理规则 (Auto-Grow Behavior)
 
 程序的核心逻辑基于**"只看尾部候选分区"**的安全策略（候选 = 末分区；末分区为 swap 时取其前一分区），以确保不移动、不猜测用户意图。以下是针对常见布局的自动处理行为总结：
