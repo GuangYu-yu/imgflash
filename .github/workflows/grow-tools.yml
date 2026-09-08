@@ -457,7 +457,11 @@ jobs:
           # ntfs-3g 一致（libtool 会吞 configure 的 -static）。
           # 多合一二进制：fsck/ 下只产出 fsck.f2fs，resize.c 编入其中，
           # resize.f2fs 仅为 make install 时按 argv[0] 分发的符号链接 → 复制两份。
+          # ac_cv_func_lseek64=yes：musl 1.2.4 起弃用 LFS64 接口，lseek64 仅为
+          # 指向 lseek 的宏，autoconf 探测函数符号失败 → f2fs-tools 自带的
+          # lseek64 兜底定义经宏展开与原型冲突（OpenWrt 8f455f7c5e 同款修复）。
           ./configure \
+            ac_cv_func_lseek64=yes \
             --prefix="$PREFIX" \
             --without-selinux \
             --without-blkid \
