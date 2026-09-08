@@ -70,6 +70,27 @@ fn put_xfs(img: &mut [u8], off: u64) {
     img[b..b + 4].copy_from_slice(b"XFSB");
 }
 
+/// squashfs 4.0 超级块：魔数 "hsqs" @0，bytes_used __le64 @0x28
+fn put_squashfs(img: &mut [u8], off: u64, bytes_used: u64) {
+    let b = off as usize;
+    img[b..b + 4].copy_from_slice(b"hsqs");
+    img[b + 0x28..b + 0x30].copy_from_slice(&bytes_used.to_le_bytes());
+}
+
+/// EROFS 超级块 @1024：魔数 0xE0F5E1E2 @0，blkszbits u8 @0x0C，blocks u32 @0x24
+fn put_erofs(img: &mut [u8], off: u64, blkszbits: u8, blocks: u32) {
+    let b = off as usize + 1024;
+    img[b..b + 4].copy_from_slice(&0xE0F5E1E2u32.to_le_bytes());
+    img[b + 0x0C] = blkszbits;
+    img[b + 0x24..b + 0x28].copy_from_slice(&blocks.to_le_bytes());
+}
+
+/// F2FS 魔数 0xF2F52010 @fs 起点 + 0x400（F2FS_SUPER_OFFSET）
+fn put_f2fs(img: &mut [u8], off: u64) {
+    let b = off as usize + 0x400;
+    img[b..b + 4].copy_from_slice(&0xF2F52010u32.to_le_bytes());
+}
+
 /// XFS 超级块字段（大端）：blocksize u32@4, dblocks u64@8（xfs_dsb __be32/__be64）
 fn put_xfs_super(img: &mut [u8], off: u64, blocksize: u32, dblocks: u64) {
     let b = off as usize;
@@ -709,6 +730,114 @@ fn analyze_btrfs_superfloppy_filesystem_only() {
         panic!("expected FilesystemOnly, got skip: {:?}", plan.skip_reason);
     };
     assert_eq!(fs, FsKind::Btrfs);
+    let _ = std::fs::remove_file(&path);
+}
+
+// ── overlay 布局（squashfs/EROFS + 同分区 RW 层）────────────────────────
+
+#[test]
+fn sniff_detects_squashfs_and_erofs() {
+    let mut img = vec![0u8; 4096];
+    put_squashfs(&mut img, 0, 1);
+    assert_eq!(sniff_fs(&mut Cursor::new(img.clone()), 0), FsKind::Squashfs);
+    let mut img2 = vec![0u8; 4096];
+    put_erofs(&mut img2, 0, 12, 1);
+    assert_eq!(sniff_fs(&mut Cursor::new(img2), 0), FsKind::Erofs);
+}
+
+#[test]
+fn analyze_overlay_squashfs_ext4_grows_with_offset() {
+    // OpenWrt combined 布局：分区头 squashfs（bytes_used = 0x10000），
+    // 64K 对齐后 overlay 起点 = 0x10000；其后是 ext4 rootfs_data
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    let part = 2048u64 * S;
+    put_squashfs(&mut img, part, 0x10000);
+    put_ext4(&mut img, part + 0x10000, 0);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { part_num, fs, overlay, .. }) = plan.action else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(part_num, 1);
+    assert_eq!(fs, FsKind::Ext);
+    assert_eq!(overlay, Some(0x10000)); // bytes_used 已 64K 对齐
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_overlay_squashfs_f2fs_grows_with_offset() {
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    let part = 2048u64 * S;
+    // bytes_used 未对齐（如 0x12345）→ 上对齐到 0x20000（fstools 同公式）
+    put_squashfs(&mut img, part, 0x12345);
+    put_f2fs(&mut img, part + 0x20000);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { fs, overlay, .. }) = plan.action else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(fs, FsKind::F2fs);
+    assert_eq!(overlay, Some(0x20000));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_overlay_first_boot_partition_grow_only() {
+    // 首启：RW 层未格式化（offset 处全零）→ 分区级扩容，fs 交由 mount_root 初始化
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    put_squashfs(&mut img, 2048 * S, 0x10000);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { fs, overlay, .. }) = plan.action else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(fs, FsKind::Unknown);
+    assert!(overlay.is_some());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_overlay_erofs_skips() {
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    put_erofs(&mut img, 2048 * S, 12, 0x1000);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
+    assert!(plan.action.is_none());
+    assert_eq!(plan.skip_reason.as_deref(), Some("EROFS rootfs overlay not supported (squashfs only in v1)"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_overlay_offset_out_of_bounds_skips() {
+    // bytes_used 声明值超出分区（镜像损坏）→ 安全跳过
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    put_squashfs(&mut img, 2048 * S, 8192 * 512 + 0x10000);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
+    assert!(plan.action.is_none());
+    assert_eq!(plan.skip_reason.as_deref(), Some("overlay offset exceeds partition bounds"));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_overlay_with_swap_last_surgery() {
+    // OpenWrt 用户自定义布局：p1 squashfs+overlay，p2 末尾 swap
+    // → 手术路径 + overlay offset 保留（分区起始 LBA 不变）
+    let mut img = mbr_disk(&[(0x83, 2048, 4096), (0x82, 6144, 2048)], 20000);
+    let part = 2048u64 * S;
+    put_squashfs(&mut img, part, 0x10000);
+    put_ext4(&mut img, part + 0x10000, 0);
+    put_swap(&mut img, 6144 * S, &[7u8; 16], "");
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { fs, surgery, overlay, .. }) = plan.action else {
+        panic!("expected surgery plan, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(fs, FsKind::Ext);
+    let s = surgery.expect("surgery plan");
+    assert_eq!(s.swap_num, 2);
+    assert_eq!(s.root_num, 1);
+    assert_eq!(overlay, Some(0x10000));
     let _ = std::fs::remove_file(&path);
 }
 

@@ -154,6 +154,10 @@ pub enum FsKind {
     Fat,
     Exfat,
     Iso9660,
+    /// 只读根 squashfs（OpenWrt combined 镜像：同分区尾部 RW overlay）
+    Squashfs,
+    /// 只读根 EROFS overlay（fstools 支持的另一种底层；此处不扩容）
+    Erofs,
     Unknown,
 }
 
@@ -337,7 +341,51 @@ pub fn sniff_fs(dev: &mut dyn ReadSeek, part_offset: u64) -> FsKind {
     if magic(buf, 0x8001, b"CD001") {
         return FsKind::Iso9660;
     }
+    // squashfs 4.0 魔数 "hsqs"（SQUASHFS_MAGIC 小端）@分区偏移 0；
+    // EROFS 魔数 __le32 0xE0F5E1E2，超级块位于偏移 1024（与 fstools rootdisk.c 一致）
+    if magic(buf, 0, b"hsqs") {
+        return FsKind::Squashfs;
+    }
+    if magic(buf, 1024, &[0xE2, 0xE1, 0xF5, 0xE0]) {
+        return FsKind::Erofs;
+    }
     FsKind::Unknown
+}
+
+// ── overlay 布局（OpenWrt combined 镜像：分区头只读根 + 同分区 RW 层）────
+
+/// overlay 起点对齐：fstools libfstools/rootdisk.c 的 ROOTDEV_OVERLAY_ALIGN。
+/// 公式必须与 fstools 逐字节一致——mount_root 建立 loop 时用的 lo_offset
+/// 即此对齐值，任何偏差都会使我们 resize 的区域与运行时 overlay 错位
+const OVERLAY_ALIGN: u64 = 64 * 1024;
+
+/// overlay 层起点（字节，相对分区头）：
+/// squashfs 4.0 → bytes_used __le64 @0x28（内核 squashfs_fs.h 结构序：
+/// 5×u32 + 4×u16 + u64 root_inode = 0x28）；
+/// EROFS → blocks u32 @超级块+0x24 左移 blkszbits u8 @超级块+0x0C
+/// （超级块 @1024，字段序同 fstools rootdisk.c 的 struct erofs_super_block）。
+/// 两者统一 64K 上对齐；解析失败或 offset 为 0 → None
+fn overlay_offset_at(dev: &mut dyn ReadSeek, part_offset: u64) -> Option<u64> {
+    let mut sb = [0u8; 2048];
+    let n = read_at(dev, part_offset, &mut sb);
+    let sb = &sb[..n];
+    let raw = if magic(sb, 0, b"hsqs") {
+        if sb.len() < 0x30 {
+            return None;
+        }
+        le64(&sb[0x28..0x30])
+    } else if sb.len() >= 1024 + 0x28 && magic(sb, 1024, &[0xE2, 0xE1, 0xF5, 0xE0]) {
+        let blkszbits = sb[1024 + 0x0C] as u32;
+        let blocks = le32(&sb[1024 + 0x24..1024 + 0x28]) as u64;
+        // blkszbits 是盘上可控值，checked_shl 挡位数溢出
+        blocks.checked_shl(blkszbits)?
+    } else {
+        return None;
+    };
+    if raw == 0 {
+        return None;
+    }
+    raw.checked_add(OVERLAY_ALIGN - 1).map(|v| v & !(OVERLAY_ALIGN - 1))
 }
 
 /// btrfs 多设备判定：超级块 @0x10000 的 num_devices 字段（相对偏移 0x88，u64 LE）。
@@ -437,6 +485,8 @@ pub struct SurgeryPlan {
     pub root_num: u32,
     pub root_first_lba: u64,
     pub root_ptype: String,
+    /// root 分区旧尺寸（sysfs 512B 扇区）——分析层算术产物，执行层只消费
+    pub root_old_sectors: u64,
     pub swap_first_lba: u64,
     pub swap_sectors: u64,
     pub swap_ptype: String,
@@ -460,6 +510,10 @@ pub enum GrowAction {
         expected_new_sectors: u64,
         old_sectors: u64,
         is_gpt: bool,
+        /// overlay 布局（OpenWrt combined 镜像）：RW 层起点（字节，相对分区头）。
+        /// Some 时 fs 扩容经临时 loop（offset 映射）执行；fs == Unknown =
+        /// 首启 rootfs_data 未格式化，分区级扩容后由 mount_root 初始化
+        overlay: Option<u64>,
     },
     /// superfloppy：无分区表——只扩 fs，不碰 sfdisk，/sys 分区判据不适用
     FilesystemOnly {
@@ -479,6 +533,8 @@ fn unsupported_reason(fs: FsKind) -> String {
         FsKind::Luks => "LUKS encryption not supported".into(),
         FsKind::Fat | FsKind::Exfat => "FAT/exFAT cannot be resized in place".into(),
         FsKind::Iso9660 => "ISO9660 filesystem".into(),
+        FsKind::Squashfs => "squashfs rootfs outside partition overlay layout".into(),
+        FsKind::Erofs => "EROFS rootfs not supported".into(),
         FsKind::Swap => "swap on superfloppy is not growable".into(),
         FsKind::Unknown => "unknown filesystem".into(),
         _ => "unsupported filesystem".into(),
@@ -510,8 +566,12 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
         return skip("cannot parse partition table");
     };
 
-    // superfloppy：直达 fs 扩容，无分区步骤
+    // superfloppy：直达 fs 扩容，无分区步骤。part= 声明在无分区盘上无法
+    // 兑现，按契约拒绝而非静默忽略
     if table.label == Label::None {
+        if let PartSpec::Number(n) = policy.part {
+            return skip(&format!("partition {n} declared but disk has no partition table"));
+        }
         let fs = sniff_fs(&mut f, 0);
         return if is_growable(fs) {
             if fs == FsKind::Btrfs && btrfs_multi_device(&mut f, 0) {
@@ -565,7 +625,7 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
     if last_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) {
         return skip("btrfs multi-device filesystem");
     }
-    let (candidate, surgery) = if last_fs == FsKind::Swap {
+    let (candidate, surgery, overlay) = if last_fs == FsKind::Swap {
         let Some(prev) = (sorted.len() >= 2).then(|| sorted[sorted.len() - 2].clone()) else {
             return skip("swap is the only partition");
         };
@@ -576,7 +636,24 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
         if prev_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, lba_to_bytes(prev.first_lba, lba_bytes)) {
             return skip("btrfs multi-device filesystem");
         }
-        if !is_growable(prev_fs) {
+        // overlay 布局同样可作为手术目标：手术只操作分区表，分区起始 LBA
+        // 不变 → overlay offset（相对分区头）手术前后不变；swap-last 是
+        // OpenWrt 用户自定义布局时 fstools 的 rootfs_data 不受影响
+        let prev_overlay = if prev_fs == FsKind::Erofs {
+            return skip("EROFS rootfs overlay not supported (squashfs only)");
+        } else if prev_fs == FsKind::Squashfs {
+            let Some(off) = overlay_offset_at(&mut f, lba_to_bytes(prev.first_lba, lba_bytes)) else {
+                return skip("cannot parse squashfs superblock for overlay offset");
+            };
+            let part_bytes = (prev.last_lba - prev.first_lba + 1).saturating_mul(lba_bytes);
+            if off >= part_bytes {
+                return skip("overlay offset exceeds partition bounds");
+            }
+            Some(off)
+        } else {
+            None
+        };
+        if !is_growable(prev_fs) && prev_overlay.is_none() {
             return skip("swap last, no growable partition before it");
         }
         let Some(si) = read_swap_info(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) else {
@@ -587,6 +664,7 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
             root_num: prev.num,
             root_first_lba: prev.first_lba,
             root_ptype: prev.ptype.clone(),
+            root_old_sectors: lba_to_sysfs(prev.last_lba - prev.first_lba + 1, lba_bytes),
             swap_first_lba: last.first_lba,
             swap_sectors: last.last_lba - last.first_lba + 1,
             swap_ptype: last.ptype.clone(),
@@ -594,13 +672,40 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
             swap_label: si.label,
             swap_partuuid: last.partuuid.clone(),
         };
-        (prev, Some(plan))
+        (prev, Some(plan), prev_overlay)
     } else if last.is_container {
         return skip("MBR logical/extended not supported in v1");
+    } else if last_fs == FsKind::Erofs {
+        // fstools 已支持 EROFS overlay；EROFS 底层不扩容，仅 squashfs
+        return skip("EROFS rootfs overlay not supported (squashfs only)");
+    } else if last_fs == FsKind::Squashfs {
+        let Some(off) = overlay_offset_at(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) else {
+            return skip("cannot parse squashfs superblock for overlay offset");
+        };
+        // offset 越过分区界 = 镜像损坏防御（squashfs 声明的 bytes_used 不可信）
+        let part_bytes = (last.last_lba - last.first_lba + 1).saturating_mul(lba_bytes);
+        if off >= part_bytes {
+            return skip("overlay offset exceeds partition bounds");
+        }
+        (last.clone(), None, Some(off))
     } else if is_growable(last_fs) {
-        (last.clone(), None)
+        (last.clone(), None, None)
     } else {
         return skip(&unsupported_reason(last_fs));
+    };
+    // 候选 fs：overlay 布局在 offset 处识别 RW 层（f2fs/ext4 可扩容；
+    // Unknown = 首启 rootfs_data 未格式化，分区级扩容后由 mount_root 以
+    // 全分区初始化，同 fstools block_volume_format 语义）
+    let plan_fs = if let Some(off) = overlay {
+        match sniff_fs(&mut f, lba_to_bytes(candidate.first_lba, lba_bytes).saturating_add(off)) {
+            k @ (FsKind::F2fs | FsKind::Ext) => k,
+            _ => FsKind::Unknown,
+        }
+    } else {
+        match surgery {
+            Some(_) => sniff_fs(&mut f, lba_to_bytes(candidate.first_lba, lba_bytes)), // 手术目标 fs（倒数第二分区）
+            None => last_fs,
+        }
     };
 
     // 声明式指定 = "候选指定"：必须命中自动候选，否则服从安全判定
@@ -620,14 +725,12 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
         action: Some(GrowAction::PartitionGrow {
             part_num: candidate.num,
             part_dev: format!("/dev/{}", part_dev_name(disk_name, candidate.num)),
-            fs: match surgery {
-                Some(_) => sniff_fs(&mut f, lba_to_bytes(candidate.first_lba, lba_bytes)), // 手术目标 fs（倒数第二分区）
-                None => last_fs,
-            },
+            fs: plan_fs,
             surgery,
             expected_new_sectors,
             old_sectors,
             is_gpt: table.label == Label::Gpt,
+            overlay,
         }),
         skip_reason: None,
     }
@@ -691,17 +794,19 @@ fn ensure_kernel_module(name: &str) -> Result<(), String> {
 }
 
 /// 原子写（write-to-tmp + rename，同 /run tmpfs 内 rename 原子），
-/// 杜绝 TUI 读到 truncate 后的空帧/半帧
+/// 杜绝 TUI 读到 truncate 后的空帧/半帧。tmp 写失败时放弃写帧——半帧
+/// 会让 TUI 把非法 status 误读为 Failed，掩盖真实结果；缺失帧由 TUI 的
+/// crash 判定兜底
 fn atomic_write(path: &str, content: &str) {
     let tmp = format!("{path}.tmp");
     if let Ok(mut f) = File::create(&tmp)
         && f.write_all(content.as_bytes()).is_ok()
+        && f.sync_all().is_ok()
+        && fs::rename(&tmp, path).is_ok()
     {
-        let _ = f.sync_all();
-        let _ = fs::rename(&tmp, path);
         return;
     }
-    let _ = fs::write(path, content); // /run 不可写时的最后尝试（结果由 TUI crash 判定兜底）
+    log_line("atomic_write failed (frame dropped, TUI crash detection takes over)");
 }
 
 /// grow.status 限定固定 phase 枚举：analyze / partition / kernel-reread / filesystem / done
@@ -752,7 +857,7 @@ impl DiskGeometry {
     fn read(disk_name: &str) -> Option<Self> {
         Some(Self {
             device_sectors: read_sys_block_size(disk_name)?,
-            lba_bytes: read_lba_size(disk_name),
+            lba_bytes: read_lba_size(disk_name)?,
         })
     }
 }
@@ -877,23 +982,42 @@ fn read_sys_block_size(disk_name: &str) -> Option<u64> {
 /// 故手术路径向 sfdisk 传 LBA 值时单位天然一致。注意：仅无名 field 输入
 /// （`, +`/`start,size,type=`）如此；带 sector-size header 的 dump 式输入
 /// 在 util-linux ≥ 2.39 会触发重算
-fn read_lba_size(disk_name: &str) -> u64 {
+fn read_lba_size(disk_name: &str) -> Option<u64> {
     fs::read_to_string(format!("/sys/block/{disk_name}/queue/logical_block_size"))
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&b| b >= SECTOR && b % SECTOR == 0)
-        .unwrap_or(SECTOR)
+        // 不做 512 兜底：4Kn 盘按 512 解析会使 GPT 头错位、分区表误读——
+        // 识别失败直接无几何可用，由调用方安全终结
 }
 
-/// sfdisk `, +` 对齐容差：sfdisk 对齐粒度 = max(I/O limits, 1MiB)（sfdisk(8)）。
-/// RAID/企业盘 optimal_io_size 可超 1MiB，固定容差会误判 kernel reread failed。
-/// 单位：sysfs 512B 扇区；0 = 设备未报告
+/// sfdisk `, +` 对齐容差：镜像 libfdisk alignment.c 的 grain 公式——
+/// io_size = optimal（缺省回退 min_io），低于 1MiB 取 1MiB；libfdisk 侧的
+/// 缩减修正（phy 对齐修正 / 小盘取 phy）只会让实际 grain 更小，容差取
+/// 公式上限即恒 ≥ 实际对齐损失。单位：sysfs 512B 扇区
 fn align_tolerance(disk_name: &str) -> u64 {
-    let optimal = fs::read_to_string(format!("/sys/block/{disk_name}/queue/optimal_io_size"))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    optimal.max(1 << 20) / SECTOR
+    let read = |f: &str| {
+        fs::read_to_string(format!("/sys/block/{disk_name}/queue/{f}"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let io_size = match read("optimal_io_size") {
+        0 => read("minimum_io_size"),
+        v => v,
+    };
+    io_size.max(1 << 20) / SECTOR
+}
+
+/// 读盘上分区表核对目标分区是否已变大——sfdisk 失败时 exit code 无法区分
+/// "写入前失败"与"写入后失败"（内核重读失败也返回非 0），以盘上事实为准
+fn disk_partition_grown(disk: &Path, part_num: u32, old_sectors: u64, lba_bytes: u64) -> bool {
+    let Ok(mut f) = File::open(disk) else { return false };
+    let Some(table) = parse_table(&mut f, lba_bytes) else { return false };
+    table.entries.iter().any(|e| {
+        e.num == part_num
+            && lba_to_sysfs(e.last_lba.saturating_sub(e.first_lba) + 1, lba_bytes) > old_sectors
+    })
 }
 
 fn sysfs_part_size(disk_name: &str, part_num: u32) -> Option<u64> {
@@ -928,14 +1052,29 @@ fn wait_partition_visible(ctx: &GrowCtx, part_num: u32, min_size: u64) -> bool {
     poll(min_size)
 }
 
-/// 读 GPT header（LBA1）字段：Some((last_usable_lba, (条目数, 条目尺寸)))
-fn read_gpt_header(disk: &str, lba_bytes: u64) -> Option<(u64, (u32, u32))> {
+/// 设备末端 LBA（唯一推导点）：device_bytes / lba_bytes − 1
+fn last_lba_of(device_bytes: u64, lba_bytes: u64) -> Option<u64> {
+    device_bytes.checked_sub(lba_bytes).map(|b| b / lba_bytes)
+}
+
+/// 读 GPT header 字段：Some((last_usable_lba, (条目数, 条目尺寸)))。
+/// 主头（LBA1）优先，损坏时按 UEFI 双副本语义回退 backup——backup 除魔数外
+/// 还须验 MyLBA（@24）== 末端 LBA，排除 dd 前旧尺寸镜像尾部残留的过时
+/// backup（其 last_usable_lba 是过期值）；字段偏移两副本相同
+fn read_gpt_header(disk: &str, device_sectors: u64, lba_bytes: u64) -> Option<(u64, (u32, u32))> {
+    let parse = |header: &[u8; 512], my_lba: u64| -> Option<(u64, (u32, u32))> {
+        (&header[0..8] == b"EFI PART" && le64(&header[24..32]) == my_lba)
+            .then(|| (le64(&header[48..56]), (le32(&header[80..84]), le32(&header[84..88]))))
+    };
+    let last_lba = last_lba_of(device_sectors.checked_mul(SECTOR)?, lba_bytes)?;
     let mut f = File::open(disk).ok()?;
-    let mut lba1 = [0u8; 512];
-    if read_at(&mut f, lba_bytes, &mut lba1) < 512 || &lba1[0..8] != b"EFI PART" {
-        return None;
+    let mut header = [0u8; 512];
+    if read_at(&mut f, lba_bytes, &mut header) == 512
+        && let Some(v) = parse(&header, 1)
+    {
+        return Some(v);
     }
-    Some((le64(&lba1[48..56]), (le32(&lba1[80..84]), le32(&lba1[84..88]))))
+    (read_at(&mut f, last_lba * lba_bytes, &mut header) == 512).then(|| parse(&header, last_lba))?
 }
 
 /// backup header 是否已在设备末端标准位（relocate 成功/无需迁移的判据）。
@@ -945,8 +1084,8 @@ fn read_gpt_header(disk: &str, lba_bytes: u64) -> Option<(u64, (u32, u32))> {
 fn backup_header_at_end(disk: &str, device_sectors: u64, lba_bytes: u64) -> bool {
     let Ok(mut f) = File::open(disk) else { return false };
     let Some(device_bytes) = device_sectors.checked_mul(SECTOR) else { return false };
+    let Some(last_lba) = last_lba_of(device_bytes, lba_bytes) else { return false };
     let Some(off) = device_bytes.checked_sub(lba_bytes) else { return false };
-    let last_lba = device_bytes / lba_bytes - 1;
     let mut header = [0u8; 512];
     let backup_ok = read_at(&mut f, off, &mut header) == 512
         && &header[0..8] == b"EFI PART"
@@ -961,24 +1100,11 @@ fn backup_header_at_end(disk: &str, device_sectors: u64, lba_bytes: u64) -> bool
         && le64(&primary[32..40]) == last_lba
 }
 
-/// 工具存在性检查集合：手术路径额外需要 sfdisk/mkswap/partx
-#[derive(Clone, Copy)]
-enum ToolNeed {
-    Plain,
-    Surgery,
-}
-
-/// 工具存在性守卫（模板 initramfs 与 grow.conf 不匹配时的安全网）。
-/// 返回 None = 齐备；Some(reason) = Skipped 原因
-fn tools_missing(fs: FsKind, need: ToolNeed) -> Option<String> {
-    let mut missing: Vec<&str> = vec![];
-    if matches!(need, ToolNeed::Surgery) {
-        for t in [SFDISK, MKSWAP, PARTX] {
-            if !Path::new(&tool_path(t)).exists() {
-                missing.push(t);
-            }
-        }
-    }
+/// fs 扩容工具存在性守卫（模板 initramfs 与 grow.conf 不匹配时的安全网）。
+/// 返回 None = 齐备；Some(reason) = Skipped 原因。
+/// 分区基础工具（sfdisk/partx/mkswap）不在此列——mkswap 仅手术需要，
+/// 由调用方按布局单独检查
+fn tools_missing(fs: FsKind) -> Option<String> {
     let fs_tools: &[&str] = match fs {
         FsKind::Ext => &[E2FSCK, RESIZE2FS],
         FsKind::Xfs => &[XFS_GROWFS],
@@ -988,11 +1114,11 @@ fn tools_missing(fs: FsKind, need: ToolNeed) -> Option<String> {
         FsKind::Lvm => &[LVM],
         _ => &[],
     };
-    for t in fs_tools {
-        if !Path::new(&tool_path(t)).exists() {
-            missing.push(t);
-        }
-    }
+    let missing: Vec<&str> = fs_tools
+        .iter()
+        .filter(|t| !Path::new(&tool_path(t)).exists())
+        .copied()
+        .collect();
     (!missing.is_empty()).then(|| format!("tools not bundled: {}", missing.join(", ")))
 }
 
@@ -1245,10 +1371,131 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
     if !matches!(lv_fs, FsKind::Ext | FsKind::Xfs | FsKind::Btrfs | FsKind::F2fs) {
         return Err(format!("LV filesystem not growable ({lv_fs:?})"));
     }
-    if let Some(reason) = tools_missing(lv_fs, ToolNeed::Plain) {
+    if let Some(reason) = tools_missing(lv_fs) {
         return Err(format!("{reason} (LV {dm})"));
     }
     resize_fs(ctx, lv_fs, &dm)
+}
+
+// ── overlay 执行层：临时 loop（offset 映射 RW 层）──────────────────────
+
+// loop ioctl 常量与结构：与 init.rs 的 squashfs 挂载共用同一组 UAPI
+// （include/uapi/linux/loop.h，内核 ≥5.8 的 LOOP_CONFIGURE；硬编码即规范）
+#[cfg(target_os = "linux")]
+mod loopabi {
+    use nix::libc;
+    pub const LOOP_CTL_GET_FREE: libc::Ioctl = 0x4C82;
+    pub const LOOP_CLR_FD: libc::Ioctl = 0x4C01;
+    pub const LOOP_CONFIGURE: libc::Ioctl = 0x4C0A;
+    pub const LOOP_MAJOR: libc::dev_t = 7;
+
+    #[repr(C)]
+    pub struct LoopInfo64 {
+        pub lo_device: u64, pub lo_inode: u64, pub lo_rdevice: u64,
+        pub lo_offset: u64, pub lo_sizelimit: u64,
+        pub lo_number: u32, pub lo_encrypt_type: u32, pub lo_encrypt_key_size: u32, pub lo_flags: u32,
+        pub lo_file_name: [u8; 64], pub lo_crypt_name: [u8; 64], pub lo_encrypt_key: [u8; 32],
+        pub lo_init: [u64; 2],
+    }
+
+    impl Default for LoopInfo64 {
+        fn default() -> Self {
+            LoopInfo64 {
+                lo_device: 0, lo_inode: 0, lo_rdevice: 0, lo_offset: 0, lo_sizelimit: 0,
+                lo_number: 0, lo_encrypt_type: 0, lo_encrypt_key_size: 0, lo_flags: 0,
+                lo_file_name: [0; 64], lo_crypt_name: [0; 64], lo_encrypt_key: [0; 32],
+                lo_init: [0; 2],
+            }
+        }
+    }
+
+    #[repr(C)]
+    pub struct LoopConfig {
+        pub fd: u32,
+        pub block_size: u32,
+        pub info: LoopInfo64,
+        pub reserved: [u64; 8],
+    }
+}
+
+/// 以 offset 映射分区内的 overlay 区域为独立块设备。resize 工具经
+/// BLKGETSIZE64 取的是 loop 可见大小（= 分区大小 − offset，lo_offset 生效
+/// 后由内核保证），不会越过 offset 触及 squashfs 区域，也不会回读底层分区
+#[cfg(target_os = "linux")]
+fn attach_loop_with_offset(ctx: &GrowCtx, backing: &Path, offset: u64) -> Result<String, String> {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::{makedev, mknod, Mode, SFlag};
+    use std::os::fd::AsRawFd;
+
+    let ctrl = open("/dev/loop-control", OFlag::O_RDWR, Mode::empty())
+        .map_err(|e| format!("open /dev/loop-control: {e}"))?;
+    let free = unsafe { nix::libc::ioctl(ctrl.as_raw_fd(), loopabi::LOOP_CTL_GET_FREE) };
+    if free < 0 {
+        return Err("LOOP_CTL_GET_FREE failed".into());
+    }
+    let loop_path = format!("/dev/loop{free}");
+    if !Path::new(&loop_path).exists() {
+        let _ = mknod(loop_path.as_str(), SFlag::S_IFBLK, Mode::from_bits_truncate(0o600),
+            makedev(loopabi::LOOP_MAJOR, free as nix::libc::dev_t));
+    }
+    let backing_fd = open(backing, OFlag::O_RDWR, Mode::empty())
+        .map_err(|e| format!("open {backing:?}: {e}"))?;
+    let cfg = loopabi::LoopConfig {
+        fd: backing_fd.as_raw_fd() as u32,
+        block_size: 0,
+        info: loopabi::LoopInfo64 { lo_offset: offset, ..Default::default() },
+        reserved: [0; 8],
+    };
+    let loop_fd = open(loop_path.as_str(), OFlag::O_RDWR, Mode::empty())
+        .map_err(|e| format!("open {loop_path}: {e}"))?;
+    let ok = unsafe {
+        nix::libc::ioctl(loop_fd.as_raw_fd(), loopabi::LOOP_CONFIGURE, &cfg as *const loopabi::LoopConfig)
+    } == 0;
+    if !ok {
+        unsafe { nix::libc::ioctl(loop_fd.as_raw_fd(), loopabi::LOOP_CLR_FD, 0) };
+        return Err(format!("LOOP_CONFIGURE with offset {offset} failed"));
+    }
+    ctx.log(&format!("loop attached: {loop_path} offset={offset}"));
+    Ok(loop_path)
+}
+
+/// loop 解绑。失败仅记日志（autoclear 语义下挂载结束即释放，残留不阻塞流程）
+#[cfg(target_os = "linux")]
+fn detach_loop(ctx: &GrowCtx, loop_dev: &str) {
+    use nix::fcntl::{open, OFlag};
+    use nix::sys::stat::Mode;
+    use std::os::fd::AsRawFd;
+    if let Ok(fd) = open(loop_dev, OFlag::O_RDWR, Mode::empty()) {
+        unsafe { nix::libc::ioctl(fd.as_raw_fd(), loopabi::LOOP_CLR_FD, 0) };
+    }
+    ctx.log(&format!("loop detached: {loop_dev}"));
+}
+
+/// overlay 布局的 fs 扩容：临时 loop 承载 RW 层 → 复用 resize_fs → 解绑。
+/// 清理失败不掩盖 resize 结果（先保存结果再解绑）。Linux-only 项目，
+/// 非 Linux 仅为宿主测试编译的占位
+fn grow_overlay_fs(ctx: &GrowCtx, fs: FsKind, part_dev: &Path, offset: u64) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let loop_dev = attach_loop_with_offset(ctx, part_dev, offset)?;
+        let result = resize_fs(ctx, fs, &loop_dev);
+        detach_loop(ctx, &loop_dev);
+        result
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // 占位分支：逐个具名绑定，签名变更时编译器强制同步，不用 allow 整体静音
+        let _ = (ctx, fs, part_dev, offset);
+        Err("overlay grow requires Linux".into())
+    }
+}
+
+/// overlay 手动恢复命令：完整自洽（建 loop → resize → 解绑），失败档共用
+fn manual_cmd_for_overlay(fs: FsKind, part_dev: &str, offset: u64) -> String {
+    format!(
+        "losetup -o {offset} /dev/loop0 {part_dev}; {} ; losetup -d /dev/loop0",
+        manual_cmd_for_fs(fs, "/dev/loop0")
+    )
 }
 
 /// --grow 子进程入口：每步失败即写 result 退出，永不 panic，exit 0 恒成立
@@ -1275,7 +1522,7 @@ pub fn run_grow(disk: &str) -> ! {
 
     match action {
         GrowAction::FilesystemOnly { fs, fs_dev } => {
-            if let Some(reason) = tools_missing(fs, ToolNeed::Plain) {
+            if let Some(reason) = tools_missing(fs) {
                 ctx.finish(Status::Skipped, &reason, "", 0, 0);
             }
             write_phase("filesystem");
@@ -1288,9 +1535,22 @@ pub fn run_grow(disk: &str) -> ! {
                 Err(reason) => ctx.finish(Status::Skipped, &reason, "", 0, 0),
             }
         }
-        GrowAction::PartitionGrow { part_num, part_dev, fs, surgery, expected_new_sectors, old_sectors, is_gpt } => {
-            if let Some(reason) = tools_missing(fs, ToolNeed::Surgery) {
+        GrowAction::PartitionGrow { part_num, part_dev, fs, surgery, expected_new_sectors, old_sectors, is_gpt, overlay } => {
+            // 工具守卫（未动盘 → Skipped）：fs 工具按布局/手术需要；
+            // sfdisk/partx 恒需（表写入与内核重读兜底）；mkswap 仅手术
+            // （非手术路径不重建 swap）
+            if ((overlay.is_some() && is_growable(fs)) || surgery.is_some())
+                && let Some(reason) = tools_missing(fs)
+            {
                 ctx.finish(Status::Skipped, &reason, "", 0, 0);
+            }
+            let missing: Vec<&str> = [SFDISK, PARTX]
+                .into_iter()
+                .chain(surgery.is_some().then_some(MKSWAP))
+                .filter(|t| !Path::new(&tool_path(t)).exists())
+                .collect();
+            if !missing.is_empty() {
+                ctx.finish(Status::Skipped, &format!("tools not bundled: {}", missing.join(", ")), "", 0, 0);
             }
             write_phase("partition");
 
@@ -1299,19 +1559,46 @@ pub fn run_grow(disk: &str) -> ! {
                 match ctx.run(&tool_path(SFDISK), &["--relocate", "gpt-bak-std", &ctx.disk], None) {
                     Some(0) => {}
                     _ => {
-                        // relocate 失败归因（它是 GPT metadata 写操作，纳入"持久变更"原则）：
-                        // 证实 backup 仍在原位（未持久变更）→ Skipped；状态无法证实 → Failed
+                        // relocate 失败按盘上事实归因（覆盖三种半迁移态）：
+                        // primary 与 backup 一致就位 → 无需迁移，继续；任一副本
+                        // 已改写而另一副本未就位 = 持久变更 → Partial；两副本
+                        // 均未改写 → Skipped（附幂等修复命令）；均不可读 → Failed
+                        let last_lba = geom
+                            .device_sectors
+                            .checked_mul(SECTOR)
+                            .and_then(|b| last_lba_of(b, geom.lba_bytes));
+                        let repair = format!("repair: sfdisk --relocate gpt-bak-std {}", ctx.disk);
                         if backup_header_at_end(&ctx.disk, geom.device_sectors, geom.lba_bytes) {
                             // 已在标准位（本就无需迁移）→ 继续
-                        } else if read_gpt_header(&ctx.disk, geom.lba_bytes).is_some() {
-                            // backup 可能被半迁移（relocate 中途失败）→ 附幂等修复命令
-                            let reason = format!(
-                                "gpt backup header relocate failed (repair: sfdisk --relocate gpt-bak-std {})",
-                                ctx.disk
-                            );
-                            ctx.finish(Status::Skipped, &reason, "", 0, 0);
                         } else {
-                            ctx.finish(Status::Failed, "gpt relocate failed (state unknown)", "", 0, 0);
+                            let read_hdr = |off: u64| -> Option<[u8; 512]> {
+                                let mut f = File::open(&ctx.disk).ok()?;
+                                let mut header = [0u8; 512];
+                                (read_at(&mut f, off, &mut header) == 512).then_some(header)
+                            };
+                            // primary 已迁移 = AlternateLBA（@32）指向设备末端
+                            let primary_moved = last_lba.is_some_and(|l| {
+                                read_hdr(geom.lba_bytes).is_some_and(|h| {
+                                    &h[0..8] == b"EFI PART" && le64(&h[32..40]) == l
+                                })
+                            });
+                            // backup 已迁移 = 末端 header 的 MyLBA（@24）指向自身
+                            let backup_moved = last_lba.is_some_and(|l| {
+                                read_hdr(l * geom.lba_bytes).is_some_and(|h| {
+                                    &h[0..8] == b"EFI PART" && le64(&h[24..32]) == l
+                                })
+                            });
+                            if primary_moved || backup_moved {
+                                let reason =
+                                    format!("gpt backup header relocate incomplete ({repair})");
+                                ctx.finish(Status::Partial, &reason, "", old_sectors * SECTOR, 0);
+                            } else if read_gpt_header(&ctx.disk, geom.device_sectors, geom.lba_bytes).is_some() {
+                                let reason =
+                                    format!("gpt backup header relocate failed ({repair})");
+                                ctx.finish(Status::Skipped, &reason, "", 0, 0);
+                            } else {
+                                ctx.finish(Status::Failed, "gpt relocate failed (state unknown)", "", 0, 0);
+                            }
                         }
                     }
                 }
@@ -1319,7 +1606,7 @@ pub fn run_grow(disk: &str) -> ! {
 
             let old_bytes = old_sectors * SECTOR;
             if let Some(s) = surgery {
-                grow_with_surgery(&ctx, &geom, is_gpt, &s, &part_dev, fs, old_bytes);
+                grow_with_surgery(&ctx, &geom, is_gpt, &s, &part_dev, fs, overlay);
             } else {
                 // 非手术：`, +`（start/type/UUID 全保留）。前置不变量：分析层已证明
                 // target 是 end-LBA 最大可扩分区且其后无障碍——安全边界全在分析层
@@ -1329,9 +1616,11 @@ pub fn run_grow(disk: &str) -> ! {
                     &["-N", &part_num.to_string(), &ctx.disk],
                     Some(stdin),
                     |c| {
-                        // GPT relocate 已提交 mutation → 不得降级 Skipped；MBR 未变更 → Skipped
                         let reason = format!("sfdisk partition grow failed (exit {c})");
-                        if is_gpt {
+                        // 归因按盘上事实：分区已变大 = 变更已发生（Partial）；
+                        // 未变大时 GPT 仍归 Partial（relocate 已改写 backup 元数据），
+                        // MBR 未动 → Skipped
+                        if is_gpt || disk_partition_grown(Path::new(&ctx.disk), part_num, old_sectors, geom.lba_bytes) {
                             ctx.finish(Status::Partial, &reason, "", old_bytes, 0);
                         } else {
                             ctx.finish(Status::Skipped, &reason, "", 0, 0);
@@ -1356,12 +1645,34 @@ pub fn run_grow(disk: &str) -> ! {
 
                 write_phase("filesystem");
                 let new_sectors = sysfs_part_size(&ctx.disk_name, part_num).unwrap_or(old_sectors);
+                let new_bytes = new_sectors * SECTOR;
+                if let Some(off) = overlay {
+                    if !is_growable(fs) {
+                        // 首启：rootfs_data 未格式化，分区级扩容即完成——
+                        // mount_root 首次挂载将以全分区初始化 RW 层
+                        ctx.finish(
+                            Status::Expanded,
+                            "overlay not formatted yet; partition expanded (mount_root will initialize it)",
+                            "", old_bytes, new_bytes,
+                        );
+                    }
+                    let manual = manual_cmd_for_overlay(fs, &part_dev, off);
+                    match grow_overlay_fs(&ctx, fs, Path::new(&part_dev), off) {
+                        Ok(()) => ctx.finish(Status::Expanded, "", "", old_bytes, new_bytes),
+                        // 持久分区表变更已发生 → Partial + 手动命令
+                        Err(reason) => ctx.finish(
+                            Status::Partial,
+                            &format!("partition expanded; overlay filesystem resize failed ({reason})"),
+                            &manual, old_bytes, new_bytes,
+                        ),
+                    };
+                }
                 match resize_fs(&ctx, fs, &part_dev) {
-                    Ok(()) => ctx.finish(Status::Expanded, "", "", old_bytes, new_sectors * SECTOR),
+                    Ok(()) => ctx.finish(Status::Expanded, "", "", old_bytes, new_bytes),
                     // 持久分区表变更已发生 → 不得降级 Skipped
                     Err(reason) => {
                         let manual = manual_cmd_for_fs(fs, &part_dev);
-                        ctx.finish(Status::Partial, &format!("partition expanded; filesystem resize failed ({reason})"), &manual, old_bytes, new_sectors * SECTOR);
+                        ctx.finish(Status::Partial, &format!("partition expanded; filesystem resize failed ({reason})"), &manual, old_bytes, new_bytes);
                     }
                 }
             }
@@ -1393,8 +1704,9 @@ fn grow_with_surgery(
     s: &SurgeryPlan,
     root_dev: &str,
     fs: FsKind,
-    old_root_bytes: u64,
+    overlay: Option<u64>,
 ) -> ! {
+    let old_root_bytes = s.root_old_sectors * SECTOR;
     let swap_dev = format!("/dev/{}", part_dev_name(&ctx.disk_name, s.swap_num));
     let lba = geom.lba_bytes;
 
@@ -1402,13 +1714,15 @@ fn grow_with_surgery(
     // 必须 relocate 后重读（顺序依赖）；重读值异常偏小时回绕会产生
     // 天文数字 LBA，checked 减法显式终结
     let usable_last = if is_gpt {
-        match read_gpt_header(&ctx.disk, lba) {
+        match read_gpt_header(&ctx.disk, geom.device_sectors, lba) {
             Some((last_usable, _)) => last_usable,
             None => ctx.finish(Status::Failed, "cannot re-read GPT header after relocate", "", 0, 0),
         }
     } else {
-        // MBR 32-bit LBA 上限；device_sectors 是 sysfs 512B 单位，先换算为 LBA
-        sysfs_to_lba(geom.device_sectors, lba).min(1u64 << 32) - 1
+        // MBR 32-bit LBA 上限；device_sectors 是 sysfs 512B 单位，先换算为 LBA。
+        // saturating_sub(1) 不依赖分析层不变式：极小盘换算为 0 时 usable_last=0，
+        // 由下方 checked 链统一终结为 Skipped
+        sysfs_to_lba(geom.device_sectors, lba).min(1u64 << 32).saturating_sub(1)
     };
     // S0 未动盘：算术异常属分析层前提失效 → Skipped（非 Failed）
     let Some(new_swap_start) = s.swap_sectors.checked_sub(1).and_then(|n| usable_last.checked_sub(n))
@@ -1462,7 +1776,10 @@ fn grow_with_surgery(
     // S2→S3 失败档：swap 分区未重建，mkswap 对不存在的节点必失败——
     // manual 必须含分区重建步骤（新位置 + 原有 type/UUID/PARTUUID 全值）
     let manual_s3_pre = mkswap_recreate(new_swap_start);
-    let manual_s4 = manual_cmd_for_fs(fs, root_dev);
+    let manual_s4 = match overlay {
+        Some(off) => manual_cmd_for_overlay(fs, root_dev, off),
+        None => manual_cmd_for_fs(fs, root_dev),
+    };
 
     // S0 → S1：删除 swap（失败 = 未动盘 → Skipped）
     ctx.run_checked(
@@ -1484,10 +1801,10 @@ fn grow_with_surgery(
             Status::Partial,
             &format!("swap deleted; target unchanged (root expand exit {c})"),
             &manual_s2,
-            0,
+            old_root_bytes,
             0,
         ),
-        || ctx.finish(Status::Failed, "sfdisk spawn failed", &manual_s2, 0, 0),
+        || ctx.finish(Status::Failed, "sfdisk spawn failed", &manual_s2, old_root_bytes, 0),
     );
     ctx.log("surgery S2: target expanded");
 
@@ -1514,20 +1831,16 @@ fn grow_with_surgery(
             &tool_path(SFDISK),
             &["--part-uuid", &ctx.disk, &s.swap_num.to_string(), pu],
             None,
-            |_| ctx.finish(
+            |c| ctx.finish(
                 Status::Partial,
-                "target expanded; swap recreation incomplete (part-uuid restore failed)",
+                &format!("target expanded; swap recreation incomplete (part-uuid restore exit {c})"),
                 &manual_s3,
                 old_root_bytes,
                 0,
             ),
-            || ctx.finish(
-                Status::Partial,
-                "target expanded; swap recreation incomplete (part-uuid restore failed)",
-                &manual_s3,
-                old_root_bytes,
-                0,
-            ),
+            // spawn 失败 = 基础设施故障（全文件惯例 → Failed），此时 swap 已
+            // 重建但 PARTUUID 缺失，状态不完整
+            || ctx.finish(Status::Failed, "sfdisk spawn failed (part-uuid restore)", &manual_s3, old_root_bytes, 0),
         );
     }
 
@@ -1564,8 +1877,28 @@ fn grow_with_surgery(
     );
     ctx.log("surgery S3 complete: swap UUID/label restored");
 
-    // S3 → S4：fs 扩容
+    // S3 → S4：fs 扩容（overlay 布局经临时 loop 映射 RW 层）
     write_phase("filesystem");
+    if let Some(off) = overlay {
+        if !is_growable(fs) {
+            // 首启：rootfs_data 未格式化，swap 重建 + 分区级扩容即完成
+            ctx.finish(
+                Status::Expanded,
+                "overlay not formatted yet; partition expanded (mount_root will initialize it)",
+                "", old_root_bytes, new_root_bytes,
+            );
+        }
+        match grow_overlay_fs(ctx, fs, Path::new(root_dev), off) {
+            Ok(()) => ctx.finish(Status::Expanded, "", "", old_root_bytes, new_root_bytes),
+            Err(reason) => ctx.finish(
+                Status::Partial,
+                &format!("swap rebuilt; overlay filesystem resize failed ({reason})"),
+                &manual_s4,
+                old_root_bytes,
+                new_root_bytes,
+            ),
+        }
+    }
     match resize_fs(ctx, fs, root_dev) {
         Ok(()) => ctx.finish(Status::Expanded, "", "", old_root_bytes, new_root_bytes),
         Err(reason) => ctx.finish(
