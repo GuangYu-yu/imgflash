@@ -734,7 +734,6 @@ fn render_notification(notification: &crate::notification::Notification, index: 
     };
 
     let text = ratatui::text::Text::from(vec![
-        Line::from(title).style(Style::new().fg(color).add_modifier(Modifier::BOLD)),
         Line::from(notification.message.as_str()),
     ]);
 
