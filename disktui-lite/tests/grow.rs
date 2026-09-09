@@ -797,13 +797,52 @@ fn analyze_overlay_first_boot_partition_grow_only() {
 }
 
 #[test]
-fn analyze_overlay_erofs_skips() {
+fn analyze_overlay_erofs_ext4_grows_with_offset() {
+    // EROFS combined 布局：blkszbits=12（4K 块）× blocks=0x10 → 用量 0x10000，
+    // 已 64K 对齐；其后 ext4 rootfs_data（fstools rootdisk.c 同公式）
     let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
-    put_erofs(&mut img, 2048 * S, 12, 0x1000);
+    let part = 2048u64 * S;
+    put_erofs(&mut img, part, 12, 0x10);
+    put_ext4(&mut img, part + 0x10000, 0);
     let path = temp_img("img", &img);
     let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
-    assert!(plan.action.is_none());
-    assert_eq!(plan.skip_reason.as_deref(), Some("EROFS rootfs overlay not supported (squashfs only in v1)"));
+    let Some(GrowAction::PartitionGrow { fs, overlay, .. }) = plan.action else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(fs, FsKind::Ext);
+    assert_eq!(overlay, Some(0x10000));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_overlay_erofs_offset_rounds_up_to_64k() {
+    // 0x15 × 0x1000（blkszbits=12）= 0x15000（未对齐）→ 上对齐到 0x20000
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    let part = 2048u64 * S;
+    put_erofs(&mut img, part, 12, 0x15);
+    put_f2fs(&mut img, part + 0x20000);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { fs, overlay, .. }) = plan.action else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(fs, FsKind::F2fs);
+    assert_eq!(overlay, Some(0x20000));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn analyze_overlay_erofs_first_boot_partition_grow_only() {
+    // 首启：RW 层未格式化（offset 处全零）→ 分区级扩容，fs 交由 mount_root 初始化
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    put_erofs(&mut img, 2048 * S, 12, 0x10);
+    let path = temp_img("img", &img);
+    let plan = analyze_with(&path, "sda", 20000, 512, &enabled_policy());
+    let Some(GrowAction::PartitionGrow { fs, overlay, .. }) = plan.action else {
+        panic!("expected PartitionGrow, got skip: {:?}", plan.skip_reason);
+    };
+    assert_eq!(fs, FsKind::Unknown);
+    assert!(overlay.is_some());
     let _ = std::fs::remove_file(&path);
 }
 

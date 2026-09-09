@@ -156,7 +156,7 @@ pub enum FsKind {
     Iso9660,
     /// 只读根 squashfs（OpenWrt combined 镜像：同分区尾部 RW overlay）
     Squashfs,
-    /// 只读根 EROFS overlay（fstools 支持的另一种底层；此处不扩容）
+    /// 只读根 EROFS overlay（OpenWrt combined 镜像：同分区尾部 RW overlay）
     Erofs,
     Unknown,
 }
@@ -534,7 +534,7 @@ fn unsupported_reason(fs: FsKind) -> String {
         FsKind::Fat | FsKind::Exfat => "FAT/exFAT cannot be resized in place".into(),
         FsKind::Iso9660 => "ISO9660 filesystem".into(),
         FsKind::Squashfs => "squashfs rootfs outside partition overlay layout".into(),
-        FsKind::Erofs => "EROFS rootfs not supported".into(),
+        FsKind::Erofs => "EROFS rootfs outside partition overlay layout".into(),
         FsKind::Swap => "swap on superfloppy is not growable".into(),
         FsKind::Unknown => "unknown filesystem".into(),
         _ => "unsupported filesystem".into(),
@@ -639,11 +639,9 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
         // overlay 布局同样可作为手术目标：手术只操作分区表，分区起始 LBA
         // 不变 → overlay offset（相对分区头）手术前后不变；swap-last 是
         // OpenWrt 用户自定义布局时 fstools 的 rootfs_data 不受影响
-        let prev_overlay = if prev_fs == FsKind::Erofs {
-            return skip("EROFS rootfs overlay not supported (squashfs only)");
-        } else if prev_fs == FsKind::Squashfs {
+        let prev_overlay = if matches!(prev_fs, FsKind::Squashfs | FsKind::Erofs) {
             let Some(off) = overlay_offset_at(&mut f, lba_to_bytes(prev.first_lba, lba_bytes)) else {
-                return skip("cannot parse squashfs superblock for overlay offset");
+                return skip("cannot parse overlay rootfs superblock");
             };
             let part_bytes = (prev.last_lba - prev.first_lba + 1).saturating_mul(lba_bytes);
             if off >= part_bytes {
@@ -675,14 +673,11 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
         (prev, Some(plan), prev_overlay)
     } else if last.is_container {
         return skip("MBR logical/extended not supported in v1");
-    } else if last_fs == FsKind::Erofs {
-        // fstools 已支持 EROFS overlay；EROFS 底层不扩容，仅 squashfs
-        return skip("EROFS rootfs overlay not supported (squashfs only)");
-    } else if last_fs == FsKind::Squashfs {
+    } else if matches!(last_fs, FsKind::Squashfs | FsKind::Erofs) {
         let Some(off) = overlay_offset_at(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) else {
-            return skip("cannot parse squashfs superblock for overlay offset");
+            return skip("cannot parse overlay rootfs superblock");
         };
-        // offset 越过分区界 = 镜像损坏防御（squashfs 声明的 bytes_used 不可信）
+        // offset 越过分区界 = 镜像损坏防御（只读根声明的用量不可信）
         let part_bytes = (last.last_lba - last.first_lba + 1).saturating_mul(lba_bytes);
         if off >= part_bytes {
             return skip("overlay offset exceeds partition bounds");
