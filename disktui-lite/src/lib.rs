@@ -7,6 +7,8 @@ pub mod init;
 #[cfg(target_os = "linux")]
 pub mod modload;
 pub mod notification;
+#[cfg(target_os = "linux")]
+pub mod sat;
 pub mod theme;
 pub mod tui;
 pub mod ui;

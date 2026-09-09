@@ -22,6 +22,16 @@ fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+/// 列宽 = 表头与所有单元格中的最大显示宽度（列数据均为 ASCII，
+/// chars().count() 等价于显示宽度）
+fn col_width<'a>(header: &'a str, cells: impl Iterator<Item = &'a str>) -> u16 {
+    cells
+        .chain(std::iter::once(header))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0) as u16
+}
+
 // ── Shared dialog helpers ─────────────────────────────────────────────
 
 /// Create a centered dialog block with the given title and border color.
@@ -144,11 +154,11 @@ fn render_disks_table(app: &mut App, frame: &mut Frame, area: Rect) {
     }
 
     let header = Row::new(vec![
-        Cell::from("Name").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
-        Cell::from("Size").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
-        Cell::from("Transport").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
-        Cell::from("Type").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
         Cell::from("Model").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
+        Cell::from("Type").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
+        Cell::from("Size").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
+        Cell::from("Serial").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
+        Cell::from("RM").style(Style::default().add_modifier(Modifier::BOLD).fg(app.theme.header)),
     ])
     .bottom_margin(1);
 
@@ -156,22 +166,38 @@ fn render_disks_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .disks
         .iter()
         .map(|disk| {
+            let disk_type = if disk.disk_type.is_empty() { "—" } else { &disk.disk_type };
             Row::new(vec![
-                Cell::from(disk.name.as_str()),
-                Cell::from(disk.size_str.as_str()),
-                Cell::from(disk.transport.as_str()),
-                Cell::from(disk.disk_type.as_str()),
                 Cell::from(disk.model.as_deref().unwrap_or_default()),
+                Cell::from(disk_type),
+                Cell::from(disk.size_str.as_str()),
+                Cell::from(disk.serial.as_deref().unwrap_or_default()),
+                Cell::from(if disk.is_removable { "Removable" } else { "Fixed" }),
             ])
         })
         .collect();
 
     let widths = [
-        Constraint::Length(app.theme.disk_name_width),
-        Constraint::Length(app.theme.disk_size_width),
-        Constraint::Length(app.theme.disk_bus_width),
-        Constraint::Length(app.theme.disk_type_width),
-        Constraint::Min(app.theme.disk_model_width),
+        Constraint::Min(col_width(
+            "Model",
+            app.disks.iter().filter_map(|d| d.model.as_deref()),
+        )),
+        Constraint::Length(col_width(
+            "Type",
+            app.disks.iter().map(|d| d.disk_type.as_str()),
+        )),
+        Constraint::Length(col_width(
+            "Size",
+            app.disks.iter().map(|d| d.size_str.as_str()),
+        )),
+        Constraint::Length(col_width(
+            "Serial",
+            app.disks.iter().filter_map(|d| d.serial.as_deref()),
+        )),
+        Constraint::Length(col_width(
+            "RM",
+            app.disks.iter().map(|d| if d.is_removable { "Removable" } else { "Fixed" }),
+        )),
     ];
 
     let table = Table::new(rows, widths)
@@ -204,8 +230,19 @@ fn render_disk_summary(app: &App, frame: &mut Frame, area: Rect) {
             "Unmounted".to_string()
         };
 
+        let mut segs = vec![
+            disk.model.as_deref().unwrap_or("Unknown").to_string(),
+            disk.transport.clone(),
+        ];
+        if let Some(s) = disk.serial.as_deref() {
+            segs.push(format!("S/N {}", s));
+        }
+        segs.push(disk.dev_path.clone());
+        segs.push(removable_str.to_string());
+        let line1 = segs.join(" | ");
+
         Line::from(vec![
-            Span::from(format!("{} | {} | {} | {}", disk.model.as_deref().unwrap_or(""), disk.transport, disk.dev_path, removable_str)),
+            Span::from(line1),
             Span::from(format!(" | {}", mount_str)),
         ])
     } else {
@@ -293,7 +330,6 @@ fn render_confirmation_dialog(app: &App, frame: &mut Frame) {
     };
     let img_bytes = app.image_file_size().unwrap_or(0);
 
-    let area = centered_rect(60, 12, frame.area());
     let block = dialog_block(" !! DANGEROUS OPERATION !! ", Color::Yellow);
 
     let (no_style, yes_style) = confirm_button_styles(
@@ -304,23 +340,39 @@ fn render_confirmation_dialog(app: &App, frame: &mut Frame) {
         /* no inactive */ Style::default().fg(Color::DarkGray),
     );
 
-    render_dialog(frame, area, block, vec![
+    // 标签列宽取最长标签 + 1 空格，对齐由宽度计算保证，不用手写空格
+    let label_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(Color::White);
+    let label_w = ["Target:", "S/N:", "Image:"]
+        .iter()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    let labeled = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{:<width$}", label, width = label_w), label_style),
+            Span::styled(value, value_style),
+        ])
+    };
+
+    let lines = vec![
         Line::from(""),
         Line::from("This will ERASE ALL DATA on the target disk!")
             .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("Target: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{} ({})", disk.dev_path, disk.size_str), Style::default().fg(Color::White)),
-        ]),
-        Line::from(vec![
-            Span::styled("Image:  ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(format_bytes(img_bytes), Style::default().fg(Color::White)),
-        ]),
+        labeled("Target:", format!("{} ({})", disk.dev_path, disk.size_str)),
+        Line::from(disk.model.as_deref().unwrap_or("Unknown").to_string()),
+        labeled("S/N:", disk.serial.as_deref().unwrap_or("N/A").to_string()),
+        labeled("Image:", format_bytes(img_bytes)),
         Line::from(""),
         yes_no_row(no_style, yes_style),
         Line::from(""),
-    ]);
+    ];
+
+    // 高度 = 内容行数 + 上下边框
+    let area = centered_rect(60, lines.len() as u16 + 2, frame.area());
+    render_dialog(frame, area, block, lines);
 }
 
 // ═══════════════════════════════════════════════════════════════════════

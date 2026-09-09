@@ -1291,7 +1291,7 @@ fn resize_lvm(ctx: &GrowCtx, target: &str) -> Result<(), String> {
         return Err("PV not in any volume group".into());
     }
 
-    // 3) VG 内 LV 清单与受益者选择（与 part= 同构的声明式策略，不猜）：
+    // 3) VG 内 LV 清单与受益者选择（与 part= 同构的声明式策略）：
     //    单 LV → 自动；多 LV → 必须命中 grow.conf `lv=` 声明，否则拒绝。
     //    默认 lvs 不加 -a，hidden 子卷（[tdata]/[tmeta]/_pmspare）不出现在
     //    输出中（lvs(8)：internal LV 仅 -a 可见），等值匹配亦不会误选；

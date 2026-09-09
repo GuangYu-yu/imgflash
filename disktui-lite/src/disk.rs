@@ -11,15 +11,16 @@ pub struct DiskInfo {
     pub size_bytes: u64,        // total size in bytes
     pub size_str: String,       // human-readable size
 
-    pub transport: String,      // nvme / usb / scsi / virtio / mmc (from /sys/block directly or best guess)
+    pub transport: String,      // NVMe / VirtIO / eMMC / IDE / USB / SATA / SAS / ATA / Unknown
 
-    pub disk_type: String,      // SSD / HDD (heuristic via queue/rotational)
+    pub disk_type: String,      // SSD / HDD；无法证实时为空（不猜）
 
     pub is_removable: bool,     // true = removable (USB), false = fixed
     pub is_mounted: bool,
     pub mount_point: Option<String>,
 
-    pub model: Option<String>,  // device-reported, may be inaccurate for USB bridges
+    pub model: Option<String>,  // 优先 SAT IDENTIFY（USB 桥后真实盘型号），回退 sysfs
+    pub serial: Option<String>, // SAT IDENTIFY（sd）/ NVMe sysfs
 }
 
 impl DiskInfo {
@@ -81,6 +82,12 @@ impl DiskInfo {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
+        // NVMe 控制器属性含 serial；sd 的 sysfs 无 serial，由 SAT 补齐
+        let serial = fs::read_to_string(base.join("device/serial"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         let removable: u8 = fs::read_to_string(base.join("removable"))
             .unwrap_or_else(|_| "0".to_string())
             .trim()
@@ -91,7 +98,38 @@ impl DiskInfo {
         let (is_mounted, mount_point) = Self::check_mounted(name);
 
         let transport = Self::detect_transport(name);
-        let disk_type = Self::detect_disk_type(&base);
+
+        // SAT IDENTIFY：sd 盘逐盘探测（SATA 直连与 USB 桥都覆盖），
+        // 成功则获得真实 model/serial 与 word217 介质转速，失败回退 sysfs 值
+        let sat = if name.starts_with("sd") {
+            sat_probe(Path::new(&format!("/dev/{}", name)))
+        } else {
+            None
+        };
+
+        // SAT 成功表明设备支持 ATA 命令集，Unknown 可升级为 ATA
+        let transport = if sat.is_some() && transport == "Unknown" {
+            "ATA".to_string()
+        } else {
+            transport
+        };
+
+        let model = sat.as_ref().map(|(m, _, _)| m.clone()).or(model);
+        let serial = sat
+            .as_ref()
+            .map(|(_, s, _)| s.clone())
+            .filter(|s| !s.is_empty())
+            .or(serial);
+        let sat_type = sat
+            .as_ref()
+            .and_then(|(_, _, r)| match r {
+                1 => Some("SSD"),
+                n if *n > 1 => Some("HDD"),
+                _ => None,
+            });
+        let disk_type = sat_type
+            .map(String::from)
+            .unwrap_or_else(|| Self::detect_disk_type(name, &base));
 
         Some(Self {
             name: name.to_string(),
@@ -104,16 +142,23 @@ impl DiskInfo {
             is_mounted,
             mount_point,
             model,
+            serial,
         })
     }
 
-    fn detect_disk_type(base: &Path) -> String {
+    /// 介质类型只输出可证实值：rotational=1 是内核事实（HDD）；
+    /// NVMe 协议即非易失固态；rotational=0 的其他设备（U 盘、virtio 等）
+    /// 既非 SSD 亦非 HDD，留空不猜。
+    fn detect_disk_type(name: &str, base: &Path) -> String {
+        if name.starts_with("nvme") {
+            return "SSD".to_string();
+        }
         let rotational: u8 = fs::read_to_string(base.join("queue/rotational"))
             .unwrap_or_else(|_| "0".to_string())
             .trim()
             .parse()
             .unwrap_or(0);
-        if rotational == 0 { "SSD".to_string() } else { "HDD".to_string() }
+        if rotational == 1 { "HDD".to_string() } else { String::new() }
     }
 
     fn detect_transport(name: &str) -> String {
@@ -132,31 +177,31 @@ impl DiskInfo {
         }
     }
 
+    /// sd 盘 transport 只依据内核事实：SAS 设备的 sas_device 对象，以及
+    /// 设备路径中的内核命名约定目录（usbN / ataX / virtioN）。
+    /// 识别不了返回 Unknown，由 SAT 探测成功后升级为 ATA。
     fn detect_sd_transport(name: &str) -> String {
         let base = Path::new("/sys/block").join(name);
 
-        // Try device/subsystem first (most direct way)
-        if let Ok(link) = fs::read_link(base.join("device/subsystem"))
-            && let Some(subsystem) = link.file_name() {
-                let s = subsystem.to_string_lossy().to_string();
-                if s == "usb" { return "USB".to_string(); }
-                if s == "virtio" { return "VirtIO".to_string(); }
-                if s != "scsi" { return s; } // e.g. "ata"
+        if base.join("device/sas_device").is_dir() {
+            return "SAS".to_string();
         }
 
-        // Fallback: read device symlink path for transport hints
         if let Ok(link) = fs::read_link(base.join("device")) {
-            let path = link.to_string_lossy();
-            if path.contains("/usb")  { return "USB".to_string(); }
-            if path.contains("/virtio") { return "VirtIO".to_string(); }
-            if path.contains("/ata")  { return "SATA".to_string(); }
+            for comp in link.to_string_lossy().split('/') {
+                if Self::is_numbered_kernel_dev(comp, "usb") { return "USB".to_string(); }
+                if Self::is_numbered_kernel_dev(comp, "ata") { return "SATA".to_string(); }
+                if Self::is_numbered_kernel_dev(comp, "virtio") { return "VirtIO".to_string(); }
+            }
         }
 
-        // Last resort: sysfs markers
-        if base.join("device/ata_device").is_dir() { return "SATA".to_string(); }
-        if base.join("device/sas_device").is_dir() { return "SAS".to_string(); }
+        "Unknown".to_string()
+    }
 
-        "SCSI".to_string()
+    /// 匹配 usb1 / ata3 / virtio0 这类内核命名约定的路径组件
+    fn is_numbered_kernel_dev(comp: &str, prefix: &str) -> bool {
+        comp.strip_prefix(prefix)
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
     }
 
     /// Check if the device or any of its partitions are mounted (via /proc/mounts).
@@ -184,4 +229,16 @@ impl DiskInfo {
         }
         (false, None)
     }
+}
+
+/// SAT 探测封装，返回 (model, serial, rotation_rate)。
+/// 非 Linux 目标恒为 None，使上层逻辑无需 cfg 分支。
+#[cfg(target_os = "linux")]
+fn sat_probe(dev_path: &Path) -> Option<(String, String, u16)> {
+    crate::sat::probe(dev_path).map(|i| (i.model, i.serial, i.rotation_rate))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sat_probe(_dev_path: &Path) -> Option<(String, String, u16)> {
+    None
 }
