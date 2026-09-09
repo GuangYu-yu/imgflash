@@ -276,9 +276,11 @@ dd 写入成功后，安装器自动将目标盘尾部空闲空间分配给可�
     *   **不存在**：跨多个分区重排或多分区同时扩容的功能。
 *   **跳过场景 (Skip)**：
     *   尾部空闲空间不足（< 1MiB）。
-    *   文件系统不支持：FAT/exFAT、**Btrfs (多设备)**、**LVM (多 LV)**、LUKS。
+    *   文件系统不支持：FAT/exFAT、**Btrfs (多设备)**、LUKS。
     *   分区表类型不支持：MBR 扩展/逻辑分区。
     *   Swap 是最后一个分区，且前一个分区不可扩展（如 FAT）。
+    *   Swap 是唯一分区（无可扩的持久数据分区）。
+    *   文件系统无法识别，或只读根声明的用量超出分区边界（镜像损坏防御）。
 *   **逃生门**：内核参数 `grow=off` 可在运行期强制禁用。
 *   **架构**：工具 + `grow.conf` 住 ISO `/grow/`；**LICENSES.txt 位于 `binaries/<ARCH>/grow/`**，作为随 Release 发布的源提供物，不注入 ISO。
 *   **架构**：initramfs 仅含 boot 必需内核模块闭包（存储/光驱/iso9660/squashfs/loop）；grow 专用内核模块（xfs/btrfs/dm-mod）随模板固化在 ISO `/grow/modules/<ver>/` 作同源来源，fast path 依据 `GROW_TOOLS` 白名单裁剪后注入最终 ISO `/grow/modules/`（仅含实际选用的 fs 模块），运行期由 modload 双根搜索（initrd miss → ISO）按需加载，工具版本与模板内核同源解耦。ext4/ntfs/f2fs 为纯用户态扩容（脱机改元数据），不关联内核模块。
