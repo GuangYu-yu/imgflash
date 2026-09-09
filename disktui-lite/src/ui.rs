@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Cell, Clear, Padding, Paragraph, Row, Table, Wrap},
@@ -178,7 +178,7 @@ fn render_disks_table(app: &mut App, frame: &mut Frame, area: Rect) {
         .collect();
 
     let widths = [
-        Constraint::Min(col_width(
+        Constraint::Length(col_width(
             "Model",
             app.disks.iter().filter_map(|d| d.model.as_deref()),
         )),
@@ -210,6 +210,7 @@ fn render_disks_table(app: &mut App, frame: &mut Frame, area: Rect) {
                 .border_type(BorderType::default()),
         )
         .column_spacing(2)
+        .flex(Flex::SpaceBetween)
         .row_highlight_style(
             Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD),
         );
