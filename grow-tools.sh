@@ -16,6 +16,10 @@ GROW_TOOLS_FULL="ext4,xfs,ntfs,btrfs,lvm,f2fs"
 # 的白名单（ext/xfs/btrfs/f2fs）——不含 ntfs，LV 上的 NTFS 运行期直接拒绝
 GROW_TOOLS_LVM_FALLBACK="lvm,ext4,xfs,btrfs,f2fs"
 
+# 探针输出布局：swap-last 时需 mkswap 重建 swap。空值 = 未经探针分析（模板侧、
+# 探针回退），grow_stage_tools 视空为保守恒打
+GROW_LAYOUT=""
+
 # GROW_TOOLS 条目精确匹配（不做子串，避免 ext4 误配 ext4foo）。读全局 GROW_TOOLS
 grow_tool_enabled() {
     tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq "${1:-}"
@@ -121,20 +125,24 @@ grow_lvm_inner_fs() {
 
 # 解析要打包的 fs 工具集：纯自动，没有配置项——由探针（$1）分析镜像（$2）得出。
 # $3 = GROW_PART（auto 或分区号），与运行期 grow.conf 的 part= 取同一值。
+# 结果写入全局 GROW_TOOLS 与 GROW_LAYOUT，不由 stdout 返回——调用处的 $( )
+# 是子 shell，函数内的赋值传不回来。
 # 探针不可用或执行失败 → 回退全量（旧模板未含 --probe 时不打断构建）。
 # 声明了分区号而探针判其不是扩容候选 → die，把错配挡在构建期
 # LVM 目标由 grow_lvm_inner_fs 离线识别内层 fs，识别不出 → 回退候选集合
 grow_resolve_tools() {
     local probe_bin="$1" image="$2" part="$3"
+    GROW_TOOLS=""
+    GROW_LAYOUT=""
     if [[ ! -x "${probe_bin}" ]]; then
         echo "  警告：探针不可用（${probe_bin}），GROW_TOOLS 回退全量" >&2
-        echo "${GROW_TOOLS_FULL}"
+        GROW_TOOLS="${GROW_TOOLS_FULL}"
         return 0
     fi
     local out
     if ! out="$("${probe_bin}" --probe "${image}" "${part}")"; then
         echo "  警告：探针执行失败，GROW_TOOLS 回退全量（要求各 fs 工具二进制齐备）" >&2
-        echo "${GROW_TOOLS_FULL}"
+        GROW_TOOLS="${GROW_TOOLS_FULL}"
         return 0
     fi
     local ok="" fs="" reason="" offset="" layout="" line
@@ -150,7 +158,7 @@ grow_resolve_tools() {
     if [[ "${ok}" == "1" ]]; then
         GROW_LAYOUT="${layout}"
         if [[ "${fs}" != "lvm" ]]; then
-            grow_tools_for_fs "${fs}"
+            GROW_TOOLS="$(grow_tools_for_fs "${fs}")"
             return 0
         fi
         # LVM 目标：内层 fs 离线识别（循环设备接出该分区 → 激活 VG → 同一个探针读 LV）。
@@ -162,16 +170,16 @@ grow_resolve_tools() {
         inner="$(grow_lvm_inner_fs "${probe_bin}" "${image}" "${offset:-0}")"
         if [[ -z "${inner}" ]]; then
             echo "  警告：未识别出 LVM 内层文件系统，按候选集合打包" >&2
-            echo "${GROW_TOOLS_LVM_FALLBACK}"
+            GROW_TOOLS="${GROW_TOOLS_LVM_FALLBACK}"
             return 0
         fi
         case "${inner}" in
             ext | xfs | btrfs | f2fs)
                 inner_tools="$(grow_tools_for_fs "${inner}")"
-                echo "lvm${inner_tools:+,${inner_tools}}"
+                GROW_TOOLS="lvm${inner_tools:+,${inner_tools}}"
                 ;;
             *)
-                echo "lvm"
+                GROW_TOOLS="lvm"
                 ;;
         esac
         return 0
@@ -179,7 +187,7 @@ grow_resolve_tools() {
     if [[ "${part}" != "auto" ]]; then
         die "GROW_PART=${part} 不是该镜像的扩容候选：${reason:-unknown}"
     fi
-    echo ""   # 镜像本无可扩目标（不支持的 fs / 无剩余空间）→ 无 fs 工具
+    # 镜像本无可扩目标（不支持的 fs / 无剩余空间）→ GROW_TOOLS 保持空
 }
 
 # 拷贝 grow 载荷二进制。$1 = 源目录（binaries/<ARCH>/grow），$2 = 目标目录。

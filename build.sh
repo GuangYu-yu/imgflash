@@ -224,7 +224,7 @@ fi
 # grow 专用模块（xfs/btrfs/dm-mod）仅在 grow 阶段按需加载，届时 ISO 已挂载，
 # 其 .ko 进 ISO /grow/modules/<ver>/
 if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
-    GROW_TOOLS="$(grow_resolve_tools "${SCRIPT_DIR}/binaries/disktui-lite" "${IMAGE_SRC}" "${GROW_PART:-auto}")"
+    grow_resolve_tools "${SCRIPT_DIR}/binaries/disktui-lite" "${IMAGE_SRC}" "${GROW_PART:-auto}"
     GROW_MODULES="$(grow_module_list)"
     echo "  grow 工具集：${GROW_TOOLS:-（空，镜像无需 fs 扩容工具）}"
 fi

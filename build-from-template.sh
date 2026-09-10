@@ -255,7 +255,7 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     printf 'enabled=1\npart=%s\n' "${GROW_PART:-auto}" > "${GROW_STAGE}/grow.conf"
 
     # 旧模板没有 /grow/probe 时由 grow_resolve_tools 回退全量
-    GROW_TOOLS="$(grow_resolve_tools "${PROBE_BIN}" "${IMAGE_PATH}" "${GROW_PART:-auto}")"
+    grow_resolve_tools "${PROBE_BIN}" "${IMAGE_PATH}" "${GROW_PART:-auto}"
     rm -f "${PROBE_BIN}"
     echo "  grow 工具集：${GROW_TOOLS:-（空，镜像无需 fs 扩容工具）}"
 
