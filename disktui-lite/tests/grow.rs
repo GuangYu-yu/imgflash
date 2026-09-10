@@ -880,6 +880,87 @@ fn analyze_overlay_with_swap_last_surgery() {
     let _ = std::fs::remove_file(&path);
 }
 
+// ── 构建期探针 ─────────────────────────────────────────────────────────
+
+#[test]
+fn probe_reports_partition_and_fs() {
+    let mut img = mbr_disk(&[(0x83, 2048, 4096)], 10000);
+    put_ext4(&mut img, 2048 * S, 0);
+    let path = temp_img("img", &img);
+    let out = grow::probe(&path, PartSpec::Auto);
+    assert!(out.contains("ok=1"), "{out}");
+    assert!(out.contains("layout=partition"), "{out}");
+    assert!(out.contains("part=1"), "{out}");
+    assert!(out.contains("fs=ext\n"), "{out}");
+    assert!(out.contains("offset_bytes=1048576\n"), "{out}");   // 2048 × 512，LVM 目标据此单独接出 PV
+    assert!(out.contains("overlay=0"), "{out}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn probe_classifies_without_device_geometry() {
+    // 末分区紧贴镜像末尾（真实镜像的常态）：分类不消费设备尺寸，仍报得出目标；
+    // 同一张镜像在 analyze_with 里会被 NoUsefulSpace 跳过（analyze_skips_when_no_free_space）
+    let mut img = mbr_disk(&[(0x83, 2048, 7952)], 10000);
+    put_ext4(&mut img, 2048 * S, 0);
+    let path = temp_img("img", &img);
+    let out = grow::probe(&path, PartSpec::Auto);
+    assert!(out.contains("ok=1"), "{out}");
+    assert!(out.contains("part=1"), "{out}");
+    assert!(out.contains("fs=ext\n"), "{out}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn probe_reports_swap_last_layout() {
+    let mut img = mbr_disk(&[(0x83, 2048, 4096), (0x82, 6144, 1024)], 10000);
+    put_ext4(&mut img, 2048 * S, 0);
+    put_swap(&mut img, 6144 * S, &[0xAB; 16], "sw");
+    let path = temp_img("img", &img);
+    let out = grow::probe(&path, PartSpec::Auto);
+    // 目标是倒数第二分区（root），不是末尾的 swap
+    assert!(out.contains("layout=swap-last"), "{out}");
+    assert!(out.contains("part=1"), "{out}");
+    assert!(out.contains("fs=ext\n"), "{out}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn probe_reports_overlay_with_unformatted_rw_layer() {
+    // OpenWrt combined：dd 后 RW 层未格式化 → unknown，构建脚本据此不打 fs 工具
+    let mut img = mbr_disk(&[(0x83, 2048, 8192)], 20000);
+    put_squashfs(&mut img, 2048 * S, 0x10000);
+    let path = temp_img("img", &img);
+    let out = grow::probe(&path, PartSpec::Auto);
+    assert!(out.contains("layout=overlay"), "{out}");
+    assert!(out.contains("fs=unknown\n"), "{out}");
+    assert!(out.contains("overlay=1"), "{out}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn probe_rejects_declared_part_mismatch() {
+    // 声明分区不是扩容候选 → ok=0（构建期据此 fail-fast）
+    let mut img = mbr_disk(&[(0x83, 2048, 4096)], 10000);
+    put_ext4(&mut img, 2048 * S, 0);
+    let path = temp_img("img", &img);
+    let out = grow::probe(&path, PartSpec::Number(2));
+    assert!(out.contains("ok=0"), "{out}");
+    assert!(out.contains("layout=none"), "{out}");
+    assert!(out.contains("not the growth candidate"), "{out}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn probe_reports_no_growable_target() {
+    let mut img = mbr_disk(&[(0x0b, 2048, 4096)], 10000);
+    put_fat(&mut img, 2048 * S);
+    let path = temp_img("img", &img);
+    let out = grow::probe(&path, PartSpec::Auto);
+    assert!(out.contains("ok=0"), "{out}");
+    let _ = std::fs::remove_file(&path);
+}
+
 // ── TUI 消费接口（固定 /run 路径，仅验证缺席时的安全行为） ─────────────
 
 #[test]

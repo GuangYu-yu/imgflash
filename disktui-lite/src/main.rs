@@ -57,6 +57,22 @@ fn main() -> AppResult<()> {
         disktui_lite::grow::run_grow(&disk);
     }
 
+    // Build-time probe: classify a disk image so the build can decide which
+    // grow tools to bundle (see grow.rs probe contract). Never used at runtime.
+    if let Some(pos) = std::env::args().position(|a| a == "--probe") {
+        let mut rest = std::env::args().skip(pos + 1);
+        let image = rest.next().unwrap_or_default();
+        let part = match rest.next().as_deref() {
+            None | Some("") | Some("auto") => disktui_lite::grow::PartSpec::Auto,
+            Some(n) => match n.parse() {
+                Ok(num) => disktui_lite::grow::PartSpec::Number(num),
+                Err(_) => disktui_lite::grow::PartSpec::Auto,
+            },
+        };
+        print!("{}", disktui_lite::grow::probe(std::path::Path::new(&image), part));
+        std::process::exit(0);
+    }
+
     // Detect if we are PID 1 (running as init in initramfs)
     let is_pid1 = cfg!(target_os = "linux") && std::process::id() == 1;
 

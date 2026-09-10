@@ -36,30 +36,6 @@ on:
         description: '指定扩容分区号（留空=自动选择）'
         required: false
         default: ''
-      grow_fs_ext4:
-        description: '打包扩容工具: ext4'
-        type: boolean
-        default: true
-      grow_fs_xfs:
-        description: '打包扩容工具: xfs'
-        type: boolean
-        default: true
-      grow_fs_ntfs:
-        description: '打包扩容工具: ntfs'
-        type: boolean
-        default: true
-      grow_fs_btrfs:
-        description: '打包扩容工具: btrfs'
-        type: boolean
-        default: true
-      grow_fs_lvm:
-        description: '打包扩容工具: lvm'
-        type: boolean
-        default: true
-      grow_fs_f2fs:
-        description: '打包扩容工具: f2fs'
-        type: boolean
-        default: true
       no_cache:
         description: '不使用缓存，强制重新构建'
         type: boolean
@@ -170,19 +146,6 @@ jobs:
       - name: "设置扩容分区覆盖"
         if: ${{ github.event.inputs.grow_part != '' }}
         run: sed -i "s/^GROW_PART=.*/GROW_PART=${{ github.event.inputs.grow_part }}/" build.env
-
-      - name: "设置扩容文件系统"
-        run: |
-          TOOLS=""
-          [ "${{ github.event.inputs.grow_fs_ext4 }}" == "true" ] && TOOLS="${TOOLS} ext4"
-          [ "${{ github.event.inputs.grow_fs_xfs }}" == "true" ] && TOOLS="${TOOLS} xfs"
-          [ "${{ github.event.inputs.grow_fs_ntfs }}" == "true" ] && TOOLS="${TOOLS} ntfs"
-          [ "${{ github.event.inputs.grow_fs_btrfs }}" == "true" ] && TOOLS="${TOOLS} btrfs"
-          [ "${{ github.event.inputs.grow_fs_lvm }}" == "true" ] && TOOLS="${TOOLS} lvm"
-          [ "${{ github.event.inputs.grow_fs_f2fs }}" == "true" ] && TOOLS="${TOOLS} f2fs"
-          TOOLS="${TOOLS# }"
-          TOOLS="${TOOLS// /,}"
-          sed -i "s/^GROW_TOOLS=.*/GROW_TOOLS=\"${TOOLS}\"/" build.env
 
       # - name: "设置安装器模式为 Shell"
       #   if: ${{ github.event.inputs.use_tui != 'true' }}

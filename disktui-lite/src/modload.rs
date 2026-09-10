@@ -9,9 +9,9 @@
 //!
 //! 多根搜索：依赖知识由 initrd `/lib/modules/<ver>/modules.dep` 一份全量提供
 //! （含 grow 条目）；grow 阶段经 `add_media_module_root()` 追加 ISO
-//! `/grow/modules/<ver>/` 作为 .ko 物理挂载点（grow 专用模块不进 initrd，见
-//! build GROW_TOOLS），该根不含独立 modules.dep。finit 按下标升序找文件，
-//! 跨根依赖由全量 map + 双根自动覆盖。
+//! `/grow/modules/<ver>/` 作为 .ko 物理挂载点（grow 专用模块不进 initrd，模板
+//! 带全量、单次构建按镜像裁剪，见 grow-tools.sh），该根不含独立 modules.dep。finit
+//! 按下标升序找文件，跨根依赖由全量 map + 双根自动覆盖。
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};

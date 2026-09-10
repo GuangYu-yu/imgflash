@@ -12,6 +12,8 @@ source "${ENV_FILE}"
 
 die() { echo "错误：$*" >&2; exit 1; }
 
+source "${SCRIPT_DIR}/grow-tools.sh"
+
 # --- DEBIAN_SUITE 留空时自动获取最新稳定版代号（dists/stable/Release 的 Codename） ---
 if [[ -z "${DEBIAN_SUITE:-}" ]]; then
     DEBIAN_SUITE="$(curl -fsSL "${DEBIAN_MIRROR}/dists/stable/Release" | awk '/^Codename:/{print $2; exit}')" \
@@ -202,22 +204,13 @@ ln -s /usr/bin/disktui-lite "${INITRAMFS_DIR}/init"
 # 工具/conf 由 fast path 注入 /grow/，但 grow 专用模块树必须随模板固化
 # （fast path 无模板 KVER 的 .ko）。模板仅含模块树，不含 grow 二进制。
 # xfs/btrfs 在线扩容需 mount（内核驱动）；lvm 需 device-mapper
-# crc32c_generic 前置于 xfs/btrfs：libcrc32c 有 softdep(pre: crc32c)，内置
-# 模块加载器与 modprobe 同样不解析 modules.softdep，不显式先载则
-# libcrc32c init 时找不到 "crc32c" 算法而失败
+# 模板与具体镜像无关，无 image 可供探针分析：模块树恒按全量固化，
+# 单次构建再由 .manifest 裁剪，故此处没有可配置项
 GROW_MODULES=""
 if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
-    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs; then
-        GROW_MODULES="${GROW_MODULES} crc32c_generic xfs"
-    fi
-    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs; then
-        GROW_MODULES="${GROW_MODULES} crc32c_generic btrfs"
-    fi
-    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm; then
-        GROW_MODULES="${GROW_MODULES} dm-mod"
-    fi
+    GROW_TOOLS="${GROW_TOOLS_FULL}"
+    GROW_MODULES="$(grow_module_list)"
 fi
-GROW_MODULES="${GROW_MODULES#" "}"
 
 # 模块列表
 BASE_MODULES="${MOD_FILESYSTEM} ${MOD_NLS} ${MOD_ATA} ${MOD_USB} ${MOD_CDROM} ${MOD_INPUT} ${MOD_EMMC} ${MOD_EMMC_CARDREADER} ${MOD_EMMC_USB:-}"
@@ -285,9 +278,9 @@ if [[ -n "${GROW_MODULES}" ]]; then
             echo "$(echo "$mod_file" | sed "s|${MOD_SRC}/||")" >> "$list"
         done < <(modprobe -d "${ROOTFS_DIR}" -S "${KVER}" --show-depends "$mod" 2>/dev/null | awk '/^insmod/ {print $2}')
     }
-    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs  && grow_manifest xfs  "${GROW_TREE_VER}/.manifest/xfs"
-    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs && grow_manifest btrfs "${GROW_TREE_VER}/.manifest/btrfs"
-    tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm   && grow_manifest dm-mod "${GROW_TREE_VER}/.manifest/lvm"
+    grow_tool_enabled xfs   && grow_manifest xfs  "${GROW_TREE_VER}/.manifest/xfs"
+    grow_tool_enabled btrfs && grow_manifest btrfs "${GROW_TREE_VER}/.manifest/btrfs"
+    grow_tool_enabled lvm   && grow_manifest dm-mod "${GROW_TREE_VER}/.manifest/lvm"
 
     for mod in ${GROW_MODULES}; do
         deps=$(modprobe -d "${ROOTFS_DIR}" -S "${KVER}" --show-depends "$mod" 2>/dev/null \
@@ -358,10 +351,13 @@ mv "${VMLINUZ}" "${ISO_DIR}/boot/vmlinuz"
 mv "${BUILD_DIR}/initrd.img" "${ISO_DIR}/boot/initrd.img"
 # grow 工具/conf/许可证均由 fast path（build-from-template.sh）注入 ISO 根 /grow/，
 # 但 grow 专用内核模块树随模板固化（fast path 无模板 KVER 的 .ko）。
-# 与模板内核同源，消除模块与工具版本的脱同步风险
+# 模块取自模板内核同版本，避免模块与内核版本错位
 if [[ "${GROW_ENABLED:-0}" == "1" && -d "${GROW_TREE}" ]]; then
     mkdir -p "${ISO_DIR}/grow/modules"
     cp -a "${GROW_TREE}/." "${ISO_DIR}/grow/modules/"
+    # 探针副本：fast path 从模板单文件提取，用于构建期分析镜像
+    cp "${SCRIPT_DIR}/binaries/disktui-lite" "${ISO_DIR}/grow/probe"
+    chmod +x "${ISO_DIR}/grow/probe"
 fi
 
 # --- BIOS 引导（syslinux，仅 amd64） ---

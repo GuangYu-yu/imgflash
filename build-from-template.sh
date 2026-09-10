@@ -12,6 +12,8 @@ source "${ENV_FILE}"
 
 die() { echo "错误：$*" >&2; exit 1; }
 
+source "${SCRIPT_DIR}/grow-tools.sh"
+
 # --- 辅助函数 ---
 verify_sha256() {
     local actual=$(sha256sum "$1" | cut -d' ' -f1)
@@ -238,43 +240,18 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     mkdir -p "${GROW_STAGE}"
     printf 'enabled=1\npart=%s\n' "${GROW_PART:-auto}" > "${GROW_STAGE}/grow.conf"
 
-    # 精确条目匹配（不用 *ext4* 子串——会误配 ext4foo 之类）
-    grow_tool_enabled() {
-        tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq "$1"
-    }
+    # 探针取自模板 /grow/probe，与 initramfs 里跑的是同一个二进制。
+    # 旧模板没有该文件时由 grow_resolve_tools 回退全量
+    PROBE_BIN="${BUILD_DIR}/probe"
+    rm -f "${PROBE_BIN}"
+    xorriso -osirrox on -indev "${TEMPLATE_PATH}" \
+        -extract /grow/probe "${PROBE_BIN}" >/dev/null 2>&1
+    [[ -f "${PROBE_BIN}" ]] && chmod +x "${PROBE_BIN}"
+    GROW_TOOLS="$(grow_resolve_tools "${PROBE_BIN}" "${IMAGE_PATH}" "${GROW_PART:-auto}")"
+    rm -f "${PROBE_BIN}"
+    echo "  grow 工具集：${GROW_TOOLS:-（空，镜像无需 fs 扩容工具）}"
 
-    for t in sfdisk mkswap partx; do
-        [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "grow 基础工具 ${t} 缺失"
-        cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
-    done
-    if grow_tool_enabled ext4; then
-        for t in e2fsck resize2fs; do
-            [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "GROW_TOOLS=ext4 但 ${t} 缺失"
-            cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
-        done
-    fi
-    if grow_tool_enabled xfs; then
-        [[ -f "${GROW_BIN_DIR}/xfs_growfs" ]] || die "GROW_TOOLS=xfs 但 xfs_growfs 缺失"
-        cp "${GROW_BIN_DIR}/xfs_growfs" "${GROW_STAGE}/"
-    fi
-    if grow_tool_enabled ntfs; then
-        [[ -f "${GROW_BIN_DIR}/ntfsresize" ]] || die "GROW_TOOLS=ntfs 但 ntfsresize 缺失"
-        cp "${GROW_BIN_DIR}/ntfsresize" "${GROW_STAGE}/"
-    fi
-    if grow_tool_enabled btrfs; then
-        [[ -f "${GROW_BIN_DIR}/btrfs" ]] || die "GROW_TOOLS=btrfs 但 btrfs 缺失"
-        cp "${GROW_BIN_DIR}/btrfs" "${GROW_STAGE}/"
-    fi
-    if grow_tool_enabled lvm; then
-        [[ -f "${GROW_BIN_DIR}/lvm" ]] || die "GROW_TOOLS=lvm 但 lvm 缺失"
-        cp "${GROW_BIN_DIR}/lvm" "${GROW_STAGE}/"
-    fi
-    if grow_tool_enabled f2fs; then
-        for t in fsck.f2fs resize.f2fs; do
-            [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "GROW_TOOLS=f2fs 但 ${t} 缺失"
-            cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
-        done
-    fi
+    grow_stage_tools "${GROW_BIN_DIR}" "${GROW_STAGE}"
 
     GROW_MAP_ARGS=(-map "${GROW_STAGE}" /grow)
 
@@ -297,7 +274,7 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
         if [[ -n "${VER_NAME}" && -d "${VER_DIR}/.manifest" ]]; then
             : > "${Gkeep}"
             for fs in xfs btrfs lvm; do
-                if grow_tool_enabled "${fs}"; then
+                if grow_tool_enabled "$fs"; then
                     L="${VER_DIR}/.manifest/${fs}"
                     [[ -f "${L}" ]] && grep -v '^$' "${L}" >> "${Gkeep}"
                 fi
@@ -320,12 +297,6 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
             fi
         fi
         rm -rf "${MOD_SRC_X}" "${Gkeep}"
-    fi
-
-    # 粗粒度 fail-fast：覆盖值必须真实存在（sfdisk 对镜像文件可用）
-    if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then
-        sfdisk -d "${IMAGE_PATH}" 2>/dev/null | grep -q "image.img${GROW_PART} :" \
-            || die "GROW_PART=${GROW_PART} 在镜像中不存在"
     fi
 fi
 

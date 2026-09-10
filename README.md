@@ -167,8 +167,7 @@ cd ..
 | `ENABLE_SECURE_BOOT` | Secure Boot 支持 | `0` |
 | `USE_TUI` | 安装器模式（1=TUI / 0=Shell） | `1` |
 | `GROW_ENABLED` | dd 后自动扩容（构建期开关，1=工具随构建注入 ISO `/grow/`） | `1` |
-| `GROW_PART` | 指定扩容分区号（`auto`=自动选择；候选校验失败则跳过） | `auto` |
-| `GROW_TOOLS` | 注入哪些文件系统扩容工具到 ISO `/grow/` 并派生对应 grow 内核模块到 `/grow/modules/`（`ext4,xfs,ntfs,btrfs,lvm,f2fs` 子集；sfdisk/mkswap/partx 为核心依赖无条件注入；仅 xfs/btrfs 关联内核模块，ext4/ntfs/f2fs 为纯用户态） | `"ext4,xfs,ntfs,btrfs,lvm,f2fs"` |
+| `GROW_PART` | 指定扩容分区号（`auto`=自动选择；非 auto 时若声明的分区不是该镜像的扩容候选，构建直接失败；运行期候选校验失败则跳过） | `auto` |
 | `BOOT_TIMEOUT` | 启动菜单超时（秒） | `0` |
 | `KERNEL_PARAMS` | 内核启动参数 | `quiet` |
 | `SCAN_TIMEOUT` | 启动时扫描介质的超时秒数 | `10` |
@@ -224,7 +223,9 @@ cd ..
 
 dd 写入成功后，安装器自动将目标盘尾部空闲空间分配给可扩容分区（末分区；若末分区为 swap，则手术重建 swap 并扩容其前一分区），并扩展其文件系统（ext4 / XFS / NTFS / Btrfs / LVM / F2FS），填满"盘 > 镜像"产生的尾部空闲空间。失败或跳过仅降级为警告，永不阻塞重启。
 
-只读根 + 同分区尾部 RW overlay 布局的固件是一个特例：这类镜像为"同分区内前半段只读根（squashfs 或 EROFS）+ 后半段 RW overlay（fstools `rootfs_data`）"布局，grow 做分区级扩容 + **首刷时交 fstools `mount_root` 格式化 RW 层**。所以**首次刷入盘时只需 `GROW_ENABLED=1`**（不勾选任何 `GROW_TOOLS`，grow 不触碰文件系统），overlay RW 层的文件系统类型由 fstools 首启时按阈值（严格大于）`partition_size − offset > 100 MiB → F2FS`，否则 EXT4（`libfstools/common.c use_f2fs()`）。但**已刷入后二次扩容**（rootfs_data 已格式化）则必须 `GROW_TOOLS=ext4,f2fs`，否则工具守卫（在动盘之前）直接 Skipped，分区与 RW 层均不会被触碰。overlay 起点公式与 fstools `rootdisk.c` 逐字节一致：squashfs 取 `bytes_used`、EROFS 取 `blocks << blkszbits`，统一上对齐 64K。
+随 ISO 打包哪些 fs 工具、派生哪些 grow 内核模块**没有配置项**：构建期用探针分析镜像定出目标文件系统，工具集与内核模块随之自动派生（LVM 目标会用循环设备离线识别 PV 内层 fs）。识别不出目标 fs 时不打包任何 fs 工具——那类镜像只需分区级扩容。模板与具体镜像无关，所以模板侧恒按全量固化模块树，单次构建再按 `.manifest` 裁剪后注入最终 ISO；探针不可用（旧模板）或分析失败时回退全量，不打断构建。
+
+只读根 + 同分区尾部 RW overlay 布局的固件是一个特例：这类镜像为"同分区内前半段只读根（squashfs 或 EROFS）+ 后半段 RW overlay（fstools `rootfs_data`）"布局，grow 做分区级扩容 + **首刷时交 fstools `mount_root` 格式化 RW 层**。RW 层尚未格式化的镜像，探针在构建期读到的是 `unknown`，因此只打包分区级扩容所需的核心工具、不打包任何 fs 工具（grow 不触碰文件系统），RW 层的文件系统类型由 fstools 首启时按阈值（严格大于）`partition_size − offset > 100 MiB → F2FS`，否则 EXT4（`libfstools/common.c use_f2fs()`）。若镜像里的 RW 层已是格式化状态（f2fs/ext4），探针按同一 offset 识别出该 fs 并自动打包对应工具；识别不出时工具守卫（在动盘之前）直接 Skipped，分区与 RW 层均不会被触碰。overlay 起点公式与 fstools `rootdisk.c` 逐字节一致：squashfs 取 `bytes_used`、EROFS 取 `blocks << blkszbits`，统一上对齐 64K。
 
 ### 常见布局与处理规则 (Auto-Grow Behavior)
 
@@ -283,7 +284,7 @@ dd 写入成功后，安装器自动将目标盘尾部空闲空间分配给可�
     *   文件系统无法识别，或只读根声明的用量超出分区边界（镜像损坏防御）。
 *   **逃生门**：内核参数 `grow=off` 可在运行期强制禁用。
 *   **架构**：工具 + `grow.conf` 住 ISO `/grow/`；**LICENSES.txt 位于 `binaries/<ARCH>/grow/`**，作为随 Release 发布的源提供物，不注入 ISO。
-*   **架构**：initramfs 仅含 boot 必需内核模块闭包（存储/光驱/iso9660/squashfs/loop）；grow 专用内核模块（xfs/btrfs/dm-mod）随模板固化在 ISO `/grow/modules/<ver>/` 作同源来源，fast path 依据 `GROW_TOOLS` 白名单裁剪后注入最终 ISO `/grow/modules/`（仅含实际选用的 fs 模块），运行期由 modload 双根搜索（initrd miss → ISO）按需加载，工具版本与模板内核同源解耦。ext4/ntfs/f2fs 为纯用户态扩容（脱机改元数据），不关联内核模块。
+*   **架构**：initramfs 仅含 boot 必需内核模块闭包（存储/光驱/iso9660/squashfs/loop）；grow 专用内核模块（xfs/btrfs/dm-mod）随模板固化在 ISO `/grow/modules/<ver>/` 作同源来源，fast path 依据自动推导出的工具清单裁剪后注入最终 ISO `/grow/modules/`（仅含实际选用的 fs 模块），运行期由 modload 双根搜索（initrd miss → ISO）按需加载，工具版本与模板内核同源解耦。ext4/ntfs/f2fs 为纯用户态扩容（脱机改元数据），不关联内核模块。
 
 安装结果屏会显示一行扩容状态（Expanded / Skipped / Partial / Failed）；Partial 状态附自包含的手动恢复命令（重启后 `/run` 数据即失）。
 

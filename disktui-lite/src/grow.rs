@@ -556,106 +556,87 @@ fn disk_name_of(disk_dev: &str) -> String {
     disk_dev.rsplit('/').next().unwrap_or(disk_dev).to_string()
 }
 
-/// 单位约定见 [`DiskGeometry`]；容量字段（old/expected_sectors）统一用 sysfs 单位
-pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes: u64, policy: &GrowPolicy) -> GrowPlan {
-    let skip = |r: &str| GrowPlan { action: None, skip_reason: Some(r.to_string()) };
-    let Ok(mut f) = File::open(dev) else {
-        return skip("cannot open device");
-    };
-    let Some(table) = parse_table(&mut f, lba_bytes) else {
-        return skip("cannot parse partition table");
-    };
+/// 分类结果：要扩谁、它是什么文件系统、布局特征。不含任何依赖设备尺寸的
+/// 判断——"有没有地方扩"是 analyze_with 的事，构建期探针只要这一半
+#[derive(Debug)]
+enum Target {
+    /// 无分区表（superfloppy）：只扩 fs
+    Superfloppy { fs: FsKind },
+    /// 分区路径：末分区，或末分区为 swap 时的倒数第二分区
+    Partition {
+        entry: PartEntry,
+        fs: FsKind,
+        surgery: Option<Box<SurgeryPlan>>,
+        overlay: Option<u64>,
+        is_gpt: bool,
+    },
+}
 
+/// 只读分类：在已解析的分区表上选出扩容目标并识别其文件系统。
+/// 拒绝路径（不支持的 fs、MBR 逻辑分区、声明分区不命中候选……）以 Err 返回，
+/// 文案与 analyze_with 的 skip_reason 逐字一致
+fn classify(f: &mut dyn ReadSeek, table: &PartTable, lba_bytes: u64, policy: &GrowPolicy) -> Result<Target, String> {
     // superfloppy：直达 fs 扩容，无分区步骤。part= 声明在无分区盘上无法
     // 兑现，按契约拒绝而非静默忽略
     if table.label == Label::None {
         if let PartSpec::Number(n) = policy.part {
-            return skip(&format!("partition {n} declared but disk has no partition table"));
+            return Err(format!("partition {n} declared but disk has no partition table"));
         }
-        let fs = sniff_fs(&mut f, 0);
-        return if is_growable(fs) {
-            if fs == FsKind::Btrfs && btrfs_multi_device(&mut f, 0) {
-                return skip("btrfs multi-device filesystem");
-            }
-            // fs_end 来自盘上 superblock，损坏时可能为超大值——用减法 + saturating 防溢出
-            if let Some(fs_end) = superfloppy_fs_end_bytes(&mut f, 0)
-                && device_sectors.saturating_mul(SECTOR).saturating_sub(fs_end)
-                    < MIN_FREE_SECTORS * SECTOR
-            {
-                return skip("no free space after filesystem");
-            }
-            GrowPlan {
-                action: Some(GrowAction::FilesystemOnly { fs, fs_dev: dev.display().to_string() }),
-                skip_reason: None,
-            }
-        } else {
-            skip(&unsupported_reason(fs))
-        };
+        let fs = sniff_fs(f, 0);
+        if !is_growable(fs) {
+            return Err(unsupported_reason(fs));
+        }
+        if fs == FsKind::Btrfs && btrfs_multi_device(f, 0) {
+            return Err("btrfs multi-device filesystem".to_string());
+        }
+        return Ok(Target::Superfloppy { fs });
     }
 
     if table.entries.is_empty() {
-        return skip("no partitions");
+        return Err("no partitions".to_string());
     }
 
     let mut sorted = table.entries.clone();
     sorted.sort_by_key(|e| e.last_lba);
     let last = sorted.last().unwrap().clone();
 
-    // NoUsefulSpace（所有空间算术只在此发生一次）：
-    // usable_end = 设备物理尾界 −（GPT：relocate 后 backup 结构保留区；MBR：32-bit LBA 上限）
-    // backup 保留区按 UEFI 条目数组下限推导（≥16384B），不硬编码 33 扇区
-    let usable_end = match table.label {
-        Label::Gpt => {
-            let (n, esz) = table.gpt_meta.unwrap_or((128, 128));
-            let reserved_lba = 1 + (n as u64 * esz as u64).div_ceil(lba_bytes);
-            device_sectors.saturating_sub(lba_to_sysfs(reserved_lba, lba_bytes))
-        }
-        // MBR 32-bit LBA 上限（512 盘 = 2^32 扇区；4Kn 盘 = 2^35）
-        _ => device_sectors.min(lba_to_sysfs(1u64 << 32, lba_bytes)),
-    };
-    // last_lba 来自盘上分区表，损坏时可达 u64::MAX——saturating 防溢出
-    let free = usable_end.saturating_sub(lba_to_sysfs(last.last_lba.saturating_add(1), lba_bytes));
-    if free < MIN_FREE_SECTORS {
-        return skip("no free space after last partition");
-    }
-
     // 候选选择（最高级不变量"绝不移动有持久数据的分区"的直接推论）：
     // 可扩集合 = {末分区} ∪ {末分区=swap 时的倒数第二分区}
-    let last_fs = sniff_fs(&mut f, lba_to_bytes(last.first_lba, lba_bytes));
-    if last_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) {
-        return skip("btrfs multi-device filesystem");
+    let last_fs = sniff_fs(f, lba_to_bytes(last.first_lba, lba_bytes));
+    if last_fs == FsKind::Btrfs && btrfs_multi_device(f, lba_to_bytes(last.first_lba, lba_bytes)) {
+        return Err("btrfs multi-device filesystem".to_string());
     }
     let (candidate, surgery, overlay) = if last_fs == FsKind::Swap {
         let Some(prev) = (sorted.len() >= 2).then(|| sorted[sorted.len() - 2].clone()) else {
-            return skip("swap is the only partition");
+            return Err("swap is the only partition".to_string());
         };
         if prev.is_container {
-            return skip("MBR logical/extended not supported in v1");
+            return Err("MBR logical/extended not supported in v1".to_string());
         }
-        let prev_fs = sniff_fs(&mut f, lba_to_bytes(prev.first_lba, lba_bytes));
-        if prev_fs == FsKind::Btrfs && btrfs_multi_device(&mut f, lba_to_bytes(prev.first_lba, lba_bytes)) {
-            return skip("btrfs multi-device filesystem");
+        let prev_fs = sniff_fs(f, lba_to_bytes(prev.first_lba, lba_bytes));
+        if prev_fs == FsKind::Btrfs && btrfs_multi_device(f, lba_to_bytes(prev.first_lba, lba_bytes)) {
+            return Err("btrfs multi-device filesystem".to_string());
         }
         // overlay 布局同样可作为手术目标：手术只操作分区表，分区起始 LBA
         // 不变 → overlay offset（相对分区头）手术前后不变；swap-last 是
         // OpenWrt 用户自定义布局时 fstools 的 rootfs_data 不受影响
         let prev_overlay = if matches!(prev_fs, FsKind::Squashfs | FsKind::Erofs) {
-            let Some(off) = overlay_offset_at(&mut f, lba_to_bytes(prev.first_lba, lba_bytes)) else {
-                return skip("cannot parse overlay rootfs superblock");
+            let Some(off) = overlay_offset_at(f, lba_to_bytes(prev.first_lba, lba_bytes)) else {
+                return Err("cannot parse overlay rootfs superblock".to_string());
             };
             let part_bytes = (prev.last_lba - prev.first_lba + 1).saturating_mul(lba_bytes);
             if off >= part_bytes {
-                return skip("overlay offset exceeds partition bounds");
+                return Err("overlay offset exceeds partition bounds".to_string());
             }
             Some(off)
         } else {
             None
         };
         if !is_growable(prev_fs) && prev_overlay.is_none() {
-            return skip("swap last, no growable partition before it");
+            return Err("swap last, no growable partition before it".to_string());
         }
-        let Some(si) = read_swap_info(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) else {
-            return skip("cannot read swap header");
+        let Some(si) = read_swap_info(f, lba_to_bytes(last.first_lba, lba_bytes)) else {
+            return Err("cannot read swap header".to_string());
         };
         let plan = SurgeryPlan {
             swap_num: last.num,
@@ -670,35 +651,35 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
             swap_label: si.label,
             swap_partuuid: last.partuuid.clone(),
         };
-        (prev, Some(plan), prev_overlay)
+        (prev, Some(Box::new(plan)), prev_overlay)
     } else if last.is_container {
-        return skip("MBR logical/extended not supported in v1");
+        return Err("MBR logical/extended not supported in v1".to_string());
     } else if matches!(last_fs, FsKind::Squashfs | FsKind::Erofs) {
-        let Some(off) = overlay_offset_at(&mut f, lba_to_bytes(last.first_lba, lba_bytes)) else {
-            return skip("cannot parse overlay rootfs superblock");
+        let Some(off) = overlay_offset_at(f, lba_to_bytes(last.first_lba, lba_bytes)) else {
+            return Err("cannot parse overlay rootfs superblock".to_string());
         };
         // offset 越过分区界 = 镜像损坏防御（只读根声明的用量不可信）
         let part_bytes = (last.last_lba - last.first_lba + 1).saturating_mul(lba_bytes);
         if off >= part_bytes {
-            return skip("overlay offset exceeds partition bounds");
+            return Err("overlay offset exceeds partition bounds".to_string());
         }
         (last.clone(), None, Some(off))
     } else if is_growable(last_fs) {
         (last.clone(), None, None)
     } else {
-        return skip(&unsupported_reason(last_fs));
+        return Err(unsupported_reason(last_fs));
     };
     // 候选 fs：overlay 布局在 offset 处识别 RW 层（f2fs/ext4 可扩容；
     // Unknown = 首启 rootfs_data 未格式化，分区级扩容后由 mount_root 以
     // 全分区初始化，同 fstools block_volume_format 语义）
-    let plan_fs = if let Some(off) = overlay {
-        match sniff_fs(&mut f, lba_to_bytes(candidate.first_lba, lba_bytes).saturating_add(off)) {
+    let fs = if let Some(off) = overlay {
+        match sniff_fs(f, lba_to_bytes(candidate.first_lba, lba_bytes).saturating_add(off)) {
             k @ (FsKind::F2fs | FsKind::Ext) => k,
             _ => FsKind::Unknown,
         }
     } else {
         match surgery {
-            Some(_) => sniff_fs(&mut f, lba_to_bytes(candidate.first_lba, lba_bytes)), // 手术目标 fs（倒数第二分区）
+            Some(_) => sniff_fs(f, lba_to_bytes(candidate.first_lba, lba_bytes)), // 手术目标 fs（倒数第二分区）
             None => last_fs,
         }
     };
@@ -707,27 +688,149 @@ pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes:
     if let PartSpec::Number(n) = policy.part
         && n != candidate.num
     {
-        return skip(&format!("partition {n} is not the growth candidate (candidate: partition {})", candidate.num));
+        return Err(format!("partition {n} is not the growth candidate (candidate: partition {})", candidate.num));
     }
 
-    let old_sectors = lba_to_sysfs(candidate.last_lba - candidate.first_lba + 1, lba_bytes);
-    let expected_new_sectors = match surgery {
-        Some(_) => 0, // 手术路径不消费（精确值 relocate 后重读）
-        None => usable_end - lba_to_sysfs(candidate.first_lba, lba_bytes),
+    Ok(Target::Partition {
+        entry: candidate,
+        fs,
+        surgery,
+        overlay,
+        is_gpt: table.label == Label::Gpt,
+    })
+}
+
+/// 单位约定见 [`DiskGeometry`]；容量字段（old/expected_sectors）统一用 sysfs 单位。
+/// 分类与空间算术分为两段：classify 决定扩谁（构建期探针也只消费这一段），
+/// 这里再判有没有地方扩
+pub fn analyze_with(dev: &Path, disk_name: &str, device_sectors: u64, lba_bytes: u64, policy: &GrowPolicy) -> GrowPlan {
+    let skip = |r: &str| GrowPlan { action: None, skip_reason: Some(r.to_string()) };
+    let Ok(mut f) = File::open(dev) else {
+        return skip("cannot open device");
+    };
+    let Some(table) = parse_table(&mut f, lba_bytes) else {
+        return skip("cannot parse partition table");
+    };
+    let target = match classify(&mut f, &table, lba_bytes, policy) {
+        Ok(t) => t,
+        Err(reason) => return skip(&reason),
     };
 
-    GrowPlan {
-        action: Some(GrowAction::PartitionGrow {
-            part_num: candidate.num,
-            part_dev: format!("/dev/{}", part_dev_name(disk_name, candidate.num)),
-            fs: plan_fs,
-            surgery,
-            expected_new_sectors,
-            old_sectors,
-            is_gpt: table.label == Label::Gpt,
-            overlay,
-        }),
-        skip_reason: None,
+    match target {
+        Target::Superfloppy { fs } => {
+            // fs_end 来自盘上 superblock，损坏时可能为超大值——用减法 + saturating 防溢出
+            if let Some(fs_end) = superfloppy_fs_end_bytes(&mut f, 0)
+                && device_sectors.saturating_mul(SECTOR).saturating_sub(fs_end)
+                    < MIN_FREE_SECTORS * SECTOR
+            {
+                return skip("no free space after filesystem");
+            }
+            GrowPlan {
+                action: Some(GrowAction::FilesystemOnly { fs, fs_dev: dev.display().to_string() }),
+                skip_reason: None,
+            }
+        }
+        Target::Partition { entry, fs, surgery, overlay, is_gpt } => {
+            // NoUsefulSpace（所有空间算术只在此发生一次）：
+            // usable_end = 设备物理尾界 −（GPT：relocate 后 backup 结构保留区；MBR：32-bit LBA 上限）
+            // backup 保留区按 UEFI 条目数组下限推导（≥16384B），不硬编码 33 扇区
+            let usable_end = if is_gpt {
+                let (n, esz) = table.gpt_meta.unwrap_or((128, 128));
+                let reserved_lba = 1 + (n as u64 * esz as u64).div_ceil(lba_bytes);
+                device_sectors.saturating_sub(lba_to_sysfs(reserved_lba, lba_bytes))
+            } else {
+                // MBR 32-bit LBA 上限（512 盘 = 2^32 扇区；4Kn 盘 = 2^35）
+                device_sectors.min(lba_to_sysfs(1u64 << 32, lba_bytes))
+            };
+            // last_lba 来自盘上分区表，损坏时可达 u64::MAX——saturating 防溢出
+            let last_end = table.entries.iter().map(|e| e.last_lba).max().unwrap_or(0);
+            if usable_end.saturating_sub(lba_to_sysfs(last_end.saturating_add(1), lba_bytes)) < MIN_FREE_SECTORS {
+                return skip("no free space after last partition");
+            }
+
+            let old_sectors = lba_to_sysfs(entry.last_lba - entry.first_lba + 1, lba_bytes);
+            let expected_new_sectors = match surgery {
+                Some(_) => 0, // 手术路径不消费（精确值 relocate 后重读）
+                None => usable_end - lba_to_sysfs(entry.first_lba, lba_bytes),
+            };
+
+            GrowPlan {
+                action: Some(GrowAction::PartitionGrow {
+                    part_num: entry.num,
+                    part_dev: format!("/dev/{}", part_dev_name(disk_name, entry.num)),
+                    fs,
+                    surgery: surgery.map(|s| *s),
+                    expected_new_sectors,
+                    old_sectors,
+                    is_gpt,
+                    overlay,
+                }),
+                skip_reason: None,
+            }
+        }
+    }
+}
+
+// ── 构建期探针（--probe） ───────────────────────────────────────────────
+
+impl FsKind {
+    /// 探针输出的 fs 名（构建脚本据此映射工具集）。显式列而不复用 Debug，
+    /// 避免变体重命名悄悄改掉对外契约
+    fn name(self) -> &'static str {
+        match self {
+            FsKind::Ext => "ext",
+            FsKind::Xfs => "xfs",
+            FsKind::Ntfs => "ntfs",
+            FsKind::Btrfs => "btrfs",
+            FsKind::F2fs => "f2fs",
+            FsKind::Swap => "swap",
+            FsKind::Luks => "luks",
+            FsKind::Lvm => "lvm",
+            FsKind::Fat => "fat",
+            FsKind::Exfat => "exfat",
+            FsKind::Iso9660 => "iso9660",
+            FsKind::Squashfs => "squashfs",
+            FsKind::Erofs => "erofs",
+            FsKind::Unknown => "unknown",
+        }
+    }
+}
+
+/// 构建期探针：只做分类，输出构建脚本据以选择打包哪些 fs 工具的键值。
+/// 不消费设备尺寸——"有没有地方扩"要到目标机上才知道，且与"带哪些工具"无关。
+/// part 与运行期 grow.conf 的 part= 同源，故"指定分区"与"自动"共用一条路径。
+/// offset_bytes 是目标分区在镜像内的字节偏移（superfloppy 为 0）：LVM 目标要靠它
+/// 把 PV 所在的那段字节单独接出来，才能在构建期识别内层文件系统
+pub fn probe(path: &Path, part: PartSpec) -> String {
+    let Ok(mut f) = File::open(path) else {
+        return "ok=0\nlayout=none\nreason=image not readable\n".to_string();
+    };
+    let Some(table) = parse_table(&mut f, SECTOR) else {
+        return "ok=0\nlayout=none\nreason=cannot parse partition table\n".to_string();
+    };
+    let policy = GrowPolicy { enabled: true, part, lv: None };
+    let target = match classify(&mut f, &table, SECTOR, &policy) {
+        Ok(t) => t,
+        Err(reason) => return format!("ok=0\nlayout=none\nreason={reason}\n"),
+    };
+    match target {
+        Target::Superfloppy { fs } => {
+            format!("ok=1\nlayout=superfloppy\nfs={}\noffset_bytes=0\n", fs.name())
+        }
+        Target::Partition { entry, fs, surgery, overlay, .. } => {
+            let layout = match (surgery.is_some(), overlay.is_some()) {
+                (true, _) => "swap-last",
+                (false, true) => "overlay",
+                (false, false) => "partition",
+            };
+            format!(
+                "ok=1\nlayout={layout}\npart={}\nfs={}\noffset_bytes={}\noverlay={}\n",
+                entry.num,
+                fs.name(),
+                lba_to_bytes(entry.first_lba, SECTOR),
+                u8::from(overlay.is_some())
+            )
+        }
     }
 }
 
@@ -1531,12 +1634,11 @@ pub fn run_grow(disk: &str) -> ! {
             }
         }
         GrowAction::PartitionGrow { part_num, part_dev, fs, surgery, expected_new_sectors, old_sectors, is_gpt, overlay } => {
-            // 工具守卫（未动盘 → Skipped）：fs 工具按布局/手术需要；
-            // sfdisk/partx 恒需（表写入与内核重读兜底）；mkswap 仅手术
-            // （非手术路径不重建 swap）
-            if ((overlay.is_some() && is_growable(fs)) || surgery.is_some())
-                && let Some(reason) = tools_missing(fs)
-            {
+            // 工具守卫（未动盘 → Skipped）：凡后续会 resize 的 fs 一律预检，
+            // 避免分区已扩而 fs 工具缺失的 Partial；overlay 未格式化的 unknown
+            // 不在预检范围（不 resize）。sfdisk/partx 恒需（表写入与内核重读
+            // 兜底）；mkswap 仅手术（非手术路径不重建 swap）
+            if let Some(reason) = tools_missing(fs) {
                 ctx.finish(Status::Skipped, &reason, "", 0, 0);
             }
             let missing: Vec<&str> = [SFDISK, PARTX]

@@ -12,6 +12,8 @@ source "${ENV_FILE}"
 
 die() { echo "错误：$*" >&2; exit 1; }
 
+source "${SCRIPT_DIR}/grow-tools.sh"
+
 # --- DEBIAN_SUITE 留空时自动获取最新稳定版代号（dists/stable/Release 的 Codename） ---
 if [[ -z "${DEBIAN_SUITE:-}" ]]; then
     DEBIAN_SUITE="$(curl -fsSL "${DEBIAN_MIRROR}/dists/stable/Release" | awk '/^Codename:/{print $2; exit}')" \
@@ -47,26 +49,8 @@ esac
 SIGNED_PKGS="${KERNEL_PKG},${GRUB_PKG}"
 [[ "${ENABLE_SECURE_BOOT:-0}" == "1" ]] && SIGNED_PKGS="${KERNEL_PKG},${SHIM_PKG},${GRUB_PKG}"
 
-# --- grow：fs 内核模块按 GROW_TOOLS 条目派生进 GROW_MODULES（不进 initrd）---
-# grow 专用模块（xfs/btrfs/dm-mod）仅在 grow 阶段按需加载，届时 ISO 已挂载；
-# 构建时其 .ko 注入 ISO /grow/modules/<ver>/（非 initrd），运行期由
-# modload 双根搜索（initrd miss → ISO）加载。
-# crc32c_generic 前置于 xfs/btrfs：libcrc32c 有 softdep(pre: crc32c)，内置
-# 模块加载器与 modprobe 同样不解析 modules.softdep，不显式先载则
-# libcrc32c init 时找不到 "crc32c" 算法而失败
+# --- grow：GROW_MODULES 由 GROW_TOOLS 派生，待镜像确定后计算 ---
 GROW_MODULES=""
-if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
-    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq xfs; then
-        GROW_MODULES="${GROW_MODULES} crc32c_generic xfs"
-    fi
-    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq btrfs; then
-        GROW_MODULES="${GROW_MODULES} crc32c_generic btrfs"
-    fi
-    if tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq lvm; then
-        GROW_MODULES="${GROW_MODULES} dm-mod"
-    fi
-fi
-GROW_MODULES="${GROW_MODULES#" "}"
 
 BASE_MODULES="${MOD_FILESYSTEM} ${MOD_NLS} ${MOD_ATA} ${MOD_USB} ${MOD_CDROM} ${MOD_INPUT} ${MOD_EMMC} ${MOD_EMMC_CARDREADER} ${MOD_EMMC_USB:-}"
 OPT_NVME=$([[ "${INCLUDE_NVME}" != "0" ]] && echo "${MOD_NVME}" || echo "")
@@ -235,6 +219,16 @@ if [[ -n "${IMAGE_PATH}" ]]; then
     ISO_NAME=${ISO_NAME:-$(basename "${IMAGE_PATH}" .img)}
 fi
 
+# --- grow 工具集：由探针分析镜像自动得出，内核模块随之派生 ---
+# 探针即构建进 initramfs 的 disktui-lite（--probe），构建期与运行期跑同一份分析代码。
+# grow 专用模块（xfs/btrfs/dm-mod）仅在 grow 阶段按需加载，届时 ISO 已挂载，
+# 其 .ko 进 ISO /grow/modules/<ver>/
+if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
+    GROW_TOOLS="$(grow_resolve_tools "${SCRIPT_DIR}/binaries/disktui-lite" "${IMAGE_SRC}" "${GROW_PART:-auto}")"
+    GROW_MODULES="$(grow_module_list)"
+    echo "  grow 工具集：${GROW_TOOLS:-（空，镜像无需 fs 扩容工具）}"
+fi
+
 # =============================================================================
 # Phase 1: mmdebstrap 创建最小 Debian 环境
 # =============================================================================
@@ -297,7 +291,7 @@ if [[ "${USE_TUI}" == "1" ]]; then
     chmod +x "${INITRAMFS_DIR}/usr/bin/disktui-lite"
     ln -s /usr/bin/disktui-lite "${INITRAMFS_DIR}/init"
 
-    # --- grow 模块注入已前移至 REQUIRED_MODULES 计算处（脚本开头）---
+    # --- grow 模块清单已随探针在镜像确定后计算（见上方 grow 工具集解析）---
 # else
 #     cp /bin/busybox "${INITRAMFS_DIR}/bin/busybox"
 #     chmod +x "${INITRAMFS_DIR}/bin/busybox"
@@ -456,14 +450,7 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
         cp -a "${GROW_TREE}/." "${GROW_STAGE}/modules/"
     fi
 
-    grow_tool_enabled() {
-        tr ',' '\n' <<< "${GROW_TOOLS:-}" | grep -Fxq "$1"
-    }
-
-    for t in sfdisk mkswap partx; do
-        [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "grow 基础工具 ${t} 缺失"
-        cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
-    done
+    grow_stage_tools "${GROW_BIN_DIR}" "${GROW_STAGE}"
 
     # 版本断言：grow.rs 依赖 --relocate（需 util-linux ≥ 2.29.1）与
     # --part-uuid/--delete（需 ≥ 2.26），取更高下限。版本行形如 "sfdisk from util-linux 2.38.1"
@@ -472,40 +459,6 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     [[ -n "${sfdisk_ver}" ]] || die "无法获取 grow sfdisk 版本"
     if ! printf '%s\n2.29.1\n' "${sfdisk_ver}" | sort -V | head -n1 | grep -qx '2.29.1'; then
         die "grow sfdisk 版本 ${sfdisk_ver} 过低：--relocate 需 util-linux ≥ 2.29.1"
-    fi
-    if grow_tool_enabled ext4; then
-        for t in e2fsck resize2fs; do
-            [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "GROW_TOOLS=ext4 但 ${t} 缺失"
-            cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
-        done
-    fi
-    if grow_tool_enabled xfs; then
-        [[ -f "${GROW_BIN_DIR}/xfs_growfs" ]] || die "GROW_TOOLS=xfs 但 xfs_growfs 缺失"
-        cp "${GROW_BIN_DIR}/xfs_growfs" "${GROW_STAGE}/"
-    fi
-    if grow_tool_enabled ntfs; then
-        [[ -f "${GROW_BIN_DIR}/ntfsresize" ]] || die "GROW_TOOLS=ntfs 但 ntfsresize 缺失"
-        cp "${GROW_BIN_DIR}/ntfsresize" "${GROW_STAGE}/"
-    fi
-    if grow_tool_enabled btrfs; then
-        [[ -f "${GROW_BIN_DIR}/btrfs" ]] || die "GROW_TOOLS=btrfs 但 btrfs 缺失"
-        cp "${GROW_BIN_DIR}/btrfs" "${GROW_STAGE}/"
-    fi
-    if grow_tool_enabled lvm; then
-        [[ -f "${GROW_BIN_DIR}/lvm" ]] || die "GROW_TOOLS=lvm 但 lvm 缺失"
-        cp "${GROW_BIN_DIR}/lvm" "${GROW_STAGE}/"
-    fi
-    if grow_tool_enabled f2fs; then
-        for t in fsck.f2fs resize.f2fs; do
-            [[ -f "${GROW_BIN_DIR}/${t}" ]] || die "GROW_TOOLS=f2fs 但 ${t} 缺失"
-            cp "${GROW_BIN_DIR}/${t}" "${GROW_STAGE}/"
-        done
-    fi
-
-    # 粗粒度 fail-fast：覆盖值必须真实存在（sfdisk 对镜像文件可用）
-    if [[ "${GROW_PART:-auto}" != "auto" ]] && command -v sfdisk &>/dev/null; then
-        sfdisk -d "${IMAGE_SRC}" 2>/dev/null | grep -q "image.img${GROW_PART} :" \
-            || die "GROW_PART=${GROW_PART} 在镜像中不存在"
     fi
 fi
 
