@@ -232,6 +232,20 @@ echo ""; echo "[Phase 2] 从模板构建 ISO ..."
 # grow 全家桶（conf + 工具 + 许可证）注入 ISO 根 /grow/——与 image.squashfs 同为
 # 每次构建可变内容；initramfs 只保留 grow 逻辑与 xfs.ko（模板期定型）
 GROW_MAP_ARGS=()
+
+# 探针取自模板 /grow/probe，与 initramfs 里跑的是同一个二进制。提取动作与
+# GROW_ENABLED 无关：模板带不带 /grow/probe 决定产物是否需要 -rm_r 摘除——
+# fast path 是模板全量复制后修改，不摘则探针会混入最终 ISO
+GROW_PROBE_RM_ARGS=()
+PROBE_BIN="${BUILD_DIR}/probe"
+rm -f "${PROBE_BIN}"
+xorriso -osirrox on -indev "${TEMPLATE_PATH}" \
+    -extract /grow/probe "${PROBE_BIN}" >/dev/null 2>&1
+if [[ -f "${PROBE_BIN}" ]]; then
+    chmod +x "${PROBE_BIN}"
+    GROW_PROBE_RM_ARGS=(-rm_r /grow/probe --)
+fi
+
 if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     GROW_BIN_DIR="${SCRIPT_DIR}/binaries/${ARCH^^}/grow"
     [[ -d "${GROW_BIN_DIR}" ]] || die "GROW_ENABLED=1 但缺少 ${GROW_BIN_DIR}，请先运行 grow-tools workflow"
@@ -240,13 +254,7 @@ if [[ "${GROW_ENABLED:-0}" == "1" ]]; then
     mkdir -p "${GROW_STAGE}"
     printf 'enabled=1\npart=%s\n' "${GROW_PART:-auto}" > "${GROW_STAGE}/grow.conf"
 
-    # 探针取自模板 /grow/probe，与 initramfs 里跑的是同一个二进制。
-    # 旧模板没有该文件时由 grow_resolve_tools 回退全量
-    PROBE_BIN="${BUILD_DIR}/probe"
-    rm -f "${PROBE_BIN}"
-    xorriso -osirrox on -indev "${TEMPLATE_PATH}" \
-        -extract /grow/probe "${PROBE_BIN}" >/dev/null 2>&1
-    [[ -f "${PROBE_BIN}" ]] && chmod +x "${PROBE_BIN}"
+    # 旧模板没有 /grow/probe 时由 grow_resolve_tools 回退全量
     GROW_TOOLS="$(grow_resolve_tools "${PROBE_BIN}" "${IMAGE_PATH}" "${GROW_PART:-auto}")"
     rm -f "${PROBE_BIN}"
     echo "  grow 工具集：${GROW_TOOLS:-（空，镜像无需 fs 扩容工具）}"
@@ -308,6 +316,7 @@ fi
 xorriso -indev "${TEMPLATE_PATH}" \
     -outdev "${FINAL_ISO}" \
     -map "${BUILD_DIR}/image.squashfs" /image.squashfs \
+    "${GROW_PROBE_RM_ARGS[@]}" \
     "${GROW_MAP_ARGS[@]}" \
     "${GROW_MOD_ARGS[@]}" \
     -volid "${VOLUME_LABEL}" \

@@ -4,7 +4,8 @@
 # 只定义函数与变量，source 时不产生副作用。调用方需已定义 die()。
 #
 # 语义边界：GROW_TOOLS 是构建期能力（打包哪些 fs 工具），永不进 grow.conf；
-# sfdisk/mkswap/partx 是 grow 核心依赖，与该变量无关，恒打包。
+# sfdisk/partx 是 grow 核心依赖，与该变量无关，恒打包；mkswap 仅 swap 手术
+# （GROW_LAYOUT=swap-last）需要，探针不可用的回退路径保守恒打。
 #
 # LVM 目标要额外依赖构建容器里的 losetup 与 lvm（--privileged 下才有 loop/dm）
 
@@ -146,6 +147,7 @@ grow_resolve_tools() {
         esac
     done <<< "${out}"
     if [[ "${ok}" == "1" ]]; then
+        GROW_LAYOUT="${layout}"
         if [[ "${fs}" != "lvm" ]]; then
             grow_tools_for_fs "${fs}"
             return 0
@@ -180,13 +182,18 @@ grow_resolve_tools() {
 }
 
 # 拷贝 grow 载荷二进制。$1 = 源目录（binaries/<ARCH>/grow），$2 = 目标目录。
-# 基础工具恒打，fs 工具按 GROW_TOOLS 逐条展开
+# sfdisk/partx 恒打；mkswap 仅 swap 手术布局需要，布局未知（探针回退）时保守恒打；
+# fs 工具按 GROW_TOOLS 逐条展开
 grow_stage_tools() {
     local src="$1" dst="$2" t fs
-    for t in sfdisk mkswap partx; do
+    for t in sfdisk partx; do
         [[ -f "${src}/${t}" ]] || die "grow 基础工具 ${t} 缺失（${src}）"
         cp "${src}/${t}" "${dst}/"
     done
+    if [[ -z "${GROW_LAYOUT}" || "${GROW_LAYOUT}" == "swap-last" ]]; then
+        [[ -f "${src}/mkswap" ]] || die "grow 基础工具 mkswap 缺失（${src}）"
+        cp "${src}/mkswap" "${dst}/"
+    fi
     for fs in ext4 xfs ntfs btrfs f2fs lvm; do
         grow_tool_enabled "$fs" || continue
         for t in $(grow_bins_of "$fs"); do
