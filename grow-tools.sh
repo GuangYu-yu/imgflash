@@ -137,13 +137,14 @@ grow_resolve_tools() {
         echo "${GROW_TOOLS_FULL}"
         return 0
     fi
-    local ok="" fs="" reason="" offset="" line
+    local ok="" fs="" reason="" offset="" layout="" line
     while IFS= read -r line; do
         case "${line%%=*}" in
             ok) ok="${line#*=}" ;;
             fs) fs="${line#*=}" ;;
             reason) reason="${line#*=}" ;;
             offset_bytes) offset="${line#*=}" ;;
+            layout) layout="${line#*=}" ;;
         esac
     done <<< "${out}"
     if [[ "${ok}" == "1" ]]; then
