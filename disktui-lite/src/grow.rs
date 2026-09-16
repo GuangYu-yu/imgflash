@@ -174,6 +174,52 @@ fn be32(b: &[u8]) -> u32 {
 fn be64(b: &[u8]) -> u64 {
     u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
 }
+
+// CRC32（IEEE 反射形式，poly 0xEDB88320）——UEFI §5.3.2 HeaderCRC32 与
+// §5.3.3 PartitionEntryArrayCRC32 用此算法（校验向量 b"123456789" → 0xCBF43926）。
+// 增量式接口供条目数组流式累加（数组可达数 MB，不整块读入内存）
+fn crc32_init() -> u32 {
+    !0
+}
+
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let t = TABLE.get_or_init(|| {
+        let mut t = [0u32; 256];
+        for (i, e) in t.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            }
+            *e = c;
+        }
+        t
+    });
+    for &b in data {
+        crc = t[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+fn crc32_finish(crc: u32) -> u32 {
+    !crc
+}
+
+pub fn crc32(data: &[u8]) -> u32 {
+    crc32_finish(crc32_update(crc32_init(), data))
+}
+
+/// GPT header CRC 校验（UEFI §5.3.2：CRC 覆盖 [0, HeaderSize)，计算时
+/// HeaderCRC32 字段本身置零；HeaderSize 合法域 [92, 512]）
+fn gpt_header_crc_ok(header: &[u8; 512]) -> bool {
+    let hs = le32(&header[8..12]) as usize;
+    if !(92..=512).contains(&hs) {
+        return false;
+    }
+    let mut h = *header;
+    h[96..100].copy_from_slice(&[0; 4]);
+    crc32(&h[..hs]) == le32(&header[96..100])
+}
 /// GUID → 规范字符串（前 3 组小端，后 2 组大端）
 fn guid_str(b: &[u8]) -> String {
     format!(
@@ -236,7 +282,10 @@ pub fn parse_table(dev: &mut dyn ReadSeek, lba_bytes: u64) -> Option<PartTable> 
     // GPT 判定：protective MBR（type 0xEE）
     if entries.iter().any(|e| e.ptype == "ee") {
         let mut lba1 = [0u8; 512];
-        if read_at(dev, lba_bytes, &mut lba1) == 512 && &lba1[0..8] == b"EFI PART" {
+        if read_at(dev, lba_bytes, &mut lba1) == 512
+            && &lba1[0..8] == b"EFI PART"
+            && gpt_header_crc_ok(&lba1)
+        {
             let entry_lba = le64(&lba1[72..80]);
             let num_entries = le32(&lba1[80..84]);
             // UEFI 规范：SizeOfPartitionEntry = 128×2ⁿ；条目数无规范上界，
@@ -245,24 +294,37 @@ pub fn parse_table(dev: &mut dyn ReadSeek, lba_bytes: u64) -> Option<PartTable> 
             if entry_size < 128 || !entry_size.is_power_of_two() || num_entries > 65536 {
                 return None;
             }
+            let stored_arr_crc = le32(&lba1[88..92]);
             let last_usable = le64(&lba1[48..56]);
             let mut gpt_entries = Vec::new();
-            // 条目内容字段全在前 128B 内（type/GUID/first/last @0..64）——
-            // 无论 entry_size 多大只读固定 128B，杜绝按盘上值分配内存
-            let mut buf = [0u8; 128];
+        // 条目数组 CRC 流式累加——逐条读完整 entry_size 供 CRC（4KiB 分块，不按盘上值分配
+        // 内存），解析只用每条目前 128B（内容字段全在其中）。短读直接判坏：
+        // 损坏条目数组不拦截会被"成功解析"，swap 手术路径据此可能删错分区
+            let mut chunk = [0u8; 4096];
+            let mut crc = crc32_init();
             for i in 0..num_entries {
-                // entry_lba/entry_size 都是盘上可控值——saturating 防溢出
-                let off = entry_lba
+                let esz = entry_size as u64;
+                let base = entry_lba
                     .saturating_mul(lba_bytes)
-                    .saturating_add((i as u64).saturating_mul(entry_size as u64));
-                if read_at(dev, off, &mut buf) < 128 {
-                    break;
+                    .saturating_add((i as u64).saturating_mul(esz));
+                let mut entry = [0u8; 128];
+                let mut done = 0u64;
+                while done < esz {
+                    let c = ((esz - done) as usize).min(chunk.len());
+                    if read_at(dev, base.saturating_add(done), &mut chunk[..c]) < c {
+                        return None;
+                    }
+                    if done == 0 {
+                        entry.copy_from_slice(&chunk[..128]);
+                    }
+                    crc = crc32_update(crc, &chunk[..c]);
+                    done += c as u64;
                 }
-                if buf[0..16].iter().all(|&b| b == 0) {
+                if entry[0..16].iter().all(|&b| b == 0) {
                     continue; // 未使用条目
                 }
-                let first = le64(&buf[32..40]);
-                let last = le64(&buf[40..48]);
+                let first = le64(&entry[32..40]);
+                let last = le64(&entry[40..48]);
                 if last < first {
                     continue;
                 }
@@ -271,9 +333,12 @@ pub fn parse_table(dev: &mut dyn ReadSeek, lba_bytes: u64) -> Option<PartTable> 
                     first_lba: first,
                     last_lba: last,
                     is_container: false,
-                    ptype: guid_str(&buf[0..16]),
-                    partuuid: Some(guid_str(&buf[16..32])),
+                    ptype: guid_str(&entry[0..16]),
+                    partuuid: Some(guid_str(&entry[16..32])),
                 });
+            }
+            if crc32_finish(crc) != stored_arr_crc {
+                return None;
             }
             return Some(PartTable {
                 label: Label::Gpt,
@@ -282,6 +347,9 @@ pub fn parse_table(dev: &mut dyn ReadSeek, lba_bytes: u64) -> Option<PartTable> 
                 gpt_last_usable_lba: Some(last_usable),
             });
         }
+        // 0xEE 已判 GPT：header 缺失/损坏（含 CRC 不符）→ 直接判坏表，
+        // 不得降级 MBR（protective MBR 本身无用户分区，降级只会产生误解析）
+        return None;
     }
 
     if entries.is_empty() {
@@ -1019,8 +1087,9 @@ impl GrowCtx {
 
     /// 工具执行：stdout/stderr 记入 grow.log。None = spawn 失败（基础设施故障）
     fn run(&self, tool: &str, args: &[&str], stdin_data: Option<&str>) -> Option<i32> {
+        // 固定 LC_ALL=C 防本地化影响输出可解析性
         let mut cmd = Command::new(tool);
-        cmd.args(args);
+        cmd.args(args).env("LC_ALL", "C");
         if stdin_data.is_some() {
             cmd.stdin(Stdio::piped());
         }
@@ -1044,7 +1113,7 @@ impl GrowCtx {
 
     /// 工具执行并返回 stdout（LVM 的 VG/LV 元数据发现）。None = spawn 失败
     fn run_capture(&self, tool: &str, args: &[&str]) -> Option<(i32, String)> {
-        let out = Command::new(tool).args(args).output().ok()?;
+        let out = Command::new(tool).args(args).env("LC_ALL", "C").output().ok()?;
         self.log_output(tool, &out);
         Some((out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).trim().to_string()))
     }
@@ -1161,7 +1230,9 @@ fn last_lba_of(device_bytes: u64, lba_bytes: u64) -> Option<u64> {
 /// backup（其 last_usable_lba 是过期值）；字段偏移两副本相同
 fn read_gpt_header(disk: &str, device_sectors: u64, lba_bytes: u64) -> Option<(u64, (u32, u32))> {
     let parse = |header: &[u8; 512], my_lba: u64| -> Option<(u64, (u32, u32))> {
-        (&header[0..8] == b"EFI PART" && le64(&header[24..32]) == my_lba)
+        (&header[0..8] == b"EFI PART"
+            && le64(&header[24..32]) == my_lba
+            && gpt_header_crc_ok(header))
             .then(|| (le64(&header[48..56]), (le32(&header[80..84]), le32(&header[84..88]))))
     };
     let last_lba = last_lba_of(device_sectors.checked_mul(SECTOR)?, lba_bytes)?;

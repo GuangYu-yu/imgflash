@@ -138,7 +138,7 @@ fn exec_identify(fd: i32, cdb_len: usize) -> Option<[u8; 512]> {
         info: 0,
     };
 
-    let rc = unsafe { libc::ioctl(fd, SG_IO, &mut hdr) };
+    let rc = unsafe { libc::ioctl(fd, SG_IO as libc::Ioctl, &mut hdr) };
     if rc == -1 {
         return None;
     }

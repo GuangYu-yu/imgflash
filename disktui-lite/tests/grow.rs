@@ -34,7 +34,7 @@ fn mbr_disk(parts: &[(u8, u64, u64)], total_sectors: u64) -> Vec<u8> {
     img
 }
 
-/// GPT：protective MBR + header（LBA1）+ 128 条目区（LBA2 起）
+/// GPT：protective MBR + header（LBA1，HeaderSize=92 + 双 CRC）+ 128 条目区（LBA2 起）
 fn gpt_disk(entries: &[([u8; 16], u64, u64)], total_sectors: u64, last_usable: u64) -> Vec<u8> {
     let mut img = vec![0u8; (total_sectors * S) as usize];
     mbr_entry(&mut img, 0, 0xEE, 1, (total_sectors - 1).min(u32::MAX as u64));
@@ -42,6 +42,7 @@ fn gpt_disk(entries: &[([u8; 16], u64, u64)], total_sectors: u64, last_usable: u
 
     let h = S as usize;
     img[h..h + 8].copy_from_slice(b"EFI PART");
+    img[h + 8..h + 12].copy_from_slice(&92u32.to_le_bytes()); // HeaderSize
     img[h + 48..h + 56].copy_from_slice(&last_usable.to_le_bytes());
     img[h + 72..h + 80].copy_from_slice(&2u64.to_le_bytes()); // entries start LBA
     img[h + 80..h + 84].copy_from_slice(&128u32.to_le_bytes()); // num entries
@@ -53,6 +54,13 @@ fn gpt_disk(entries: &[([u8; 16], u64, u64)], total_sectors: u64, last_usable: u
         img[off + 32..off + 40].copy_from_slice(&first.to_le_bytes());
         img[off + 40..off + 48].copy_from_slice(&last.to_le_bytes());
     }
+    // 条目区 CRC（覆盖 num_entries × entry_size 字节）
+    let arr = 2 * S as usize;
+    let arr_crc = grow::crc32(&img[arr..arr + 128 * 128]);
+    img[h + 88..h + 92].copy_from_slice(&arr_crc.to_le_bytes());
+    // header CRC（覆盖 [0,92)，HeaderCRC32 字段在 92 之外）
+    let hdr_crc = grow::crc32(&img[h..h + 92]);
+    img[h + 96..h + 100].copy_from_slice(&hdr_crc.to_le_bytes());
     img
 }
 
@@ -241,6 +249,30 @@ fn parse_table_gpt_entries_and_header_fields() {
     );
     assert_eq!(t.gpt_meta, Some((128, 128)));
     assert_eq!(t.gpt_last_usable_lba, Some(9967));
+}
+
+/// CRC32 算法自校验（IEEE 反射形式标准校验向量）
+#[test]
+fn crc32_known_vector() {
+    assert_eq!(grow::crc32(b"123456789"), 0xCBF4_3926);
+}
+
+/// 条目数组 CRC 损坏 → 拒绝解析（防手术路径据坏表删错分区）
+#[test]
+fn parse_table_rejects_gpt_with_bad_entries_crc() {
+    let mut img = gpt_disk(&[([0x11; 16], 2048, 6143)], 10000, 9967);
+    img[2 * S as usize] ^= 0xFF;
+    let mut cur = Cursor::new(img);
+    assert!(parse_table(&mut cur, S).is_none());
+}
+
+/// header CRC 损坏 → 拒绝解析
+#[test]
+fn parse_table_rejects_gpt_with_bad_header_crc() {
+    let mut img = gpt_disk(&[([0x11; 16], 2048, 6143)], 10000, 9967);
+    img[S as usize + 16] ^= 0xFF;
+    let mut cur = Cursor::new(img);
+    assert!(parse_table(&mut cur, S).is_none());
 }
 
 #[test]
@@ -573,6 +605,12 @@ fn analyze_4kn_gpt_lba_unit_conversion() {
     img[off..off + 16].copy_from_slice(&linux_guid);
     img[off + 32..off + 40].copy_from_slice(&256u64.to_le_bytes()); // p1: LBA 256..767
     img[off + 40..off + 48].copy_from_slice(&767u64.to_le_bytes());
+    img[h + 8..h + 12].copy_from_slice(&92u32.to_le_bytes()); // HeaderSize
+    let arr_end = off + 128 * 128;
+    let arr_crc = grow::crc32(&img[off..arr_end]);
+    img[h + 88..h + 92].copy_from_slice(&arr_crc.to_le_bytes());
+    let hdr_crc = grow::crc32(&img[h..h + 92]);
+    img[h + 96..h + 100].copy_from_slice(&hdr_crc.to_le_bytes());
     put_ext4(&mut img, 256 * L, 0);
 
     let path = temp_img("img4k", &img);
