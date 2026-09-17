@@ -1374,8 +1374,12 @@ fn resize_fs(ctx: &GrowCtx, fs: FsKind, target: &str) -> Result<(), String> {
             let Some(code) = ctx.run(&tool_path(E2FSCK), &["-fp", target], None) else {
                 return Err("e2fsck spawn failed".into());
             };
-            // 显式白名单 0..=2，禁止 4+——防未来退出码扩展自动放行
-            if !matches!(code, 0..=2) {
+            // 白名单 0|1（e2fsprogs unix.c：bit1=REBOOT 仅在 FS 被修改且为 root fs 时置位，
+            // 本路径扩的正是 rootfs——2/3 出现即须重启，不得当普通成功继续 resize）
+            if !matches!(code, 0 | 1) {
+                if matches!(code, 2 | 3) {
+                    return Err(format!("e2fsck rejected (exit {code}, root filesystem modified, reboot required)"));
+                }
                 return Err(format!("e2fsck rejected (exit {code}, filesystem inconsistent)"));
             }
             match ctx.run(&tool_path(RESIZE2FS), &[target], None) {
